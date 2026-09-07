@@ -1,0 +1,113 @@
+GOAL
+Add REAL-TIME UPSCALING as a third path so the window can be 1080p/4K while we trace a smaller film. I want to SEE this working.
+
+Keep:
+  --mode native    → 1:1 pixels, uniform spp, NO adaptive, NO upscale, NO reconstruct
+  --mode adaptive  → variable spp (B1), full film = output, no upscale unless I also pass --upscale
+
+NEW:
+  --mode upscale   → trace at internal res, upsample to output every frame (this is the demo)
+
+I want Upscale on screen first. Native/Adaptive must remain one flag away. Do not polish Native. Do not implement DLSS/FSR2/XeSS SDKs unless already in the repo.
+
+--------------------------------------------------
+CONCEPT (do not mix)
+- Native:    outputRes traced, uniform spp
+- Adaptive:  outputRes traced, smarter spp (and optional quadtree later)
+- Upscale:   internalRes traced, then a scaler writes outputRes
+internalRes = round(outputRes * scale) with scale in {0.5, 0.67, 0.77, 0.85} typical.
+Never present internalRes stretched by the window/swapchain. The scaler owns the blow-up.
+
+--------------------------------------------------
+CLI
+  --mode upscale --width 1920 --height 1080 --scale 0.67 --upscaler spatial --spp 1
+  --mode native  --width 1920 --height 1080 --spp 64
+  --mode adaptive ...   (unchanged)
+
+Flags:
+  --scale <0.5..1.0>     internal/output (1.0 == no scale; refuse to run upscaler)
+  --upscaler spatial|none
+  --cas <0..1>           sharpen after upscale, default 0.4 for spatial, 0 for native
+  --jitter off           default OFF this pass (no TAA yet)
+
+If --mode native: ignore --scale/--upscaler (force 1.0 / none). Hard error or silent ignore, but do not upscale.
+
+--------------------------------------------------
+IMPLEMENT THIS PASS — spatial upscale only
+
+1. Split sizes
+   outputW/H = window / PNG size
+   renderW/H = max(1, round(outputW * scale))  (same for H)
+   Film, rays, Adaptive tiles, denoiser input = renderW/H
+   Present/save = outputW/H
+
+2. Frame loop (Upscale mode)
+   a. Trace film at renderW/H (reuse current integrator; spp as given; jitter OFF)
+   b. Optional: existing denoise on HDR at renderW/H (flag, default off)
+   c. Exposure / pupil on the SMALL film (log-average of internal HDR)
+   d. Tone map small film → linear or rec.709 LDR working buffer (document which)
+   e. Spatial upscale small → outputW/H
+   f. Optional CAS/RCAS sharpen at output res
+   g. sRGB encode / present / save
+
+   Bounce loop never sees outputW/H.
+
+3. Spatial scaler (pick ONE, implement cleanly)
+   Preferred: EASU-like (FSR 1 style) or separable Lanczos-3 / Catmull-Rom bicubic
+   Fallback if you want it in one sitting: bicubic (not bilinear). Bilinear is unacceptable as the demo.
+   Edge-aware is good; nearest is forbidden.
+
+   Work in the tone-mapped display buffer for this pass (classic FSR1). Do not EASU in raw HDR.
+
+4. CAS after upscale (cheap, visible)
+   w = casAmount  (0.4 default)
+   per channel, 3×3 neighborhood, AMD CAS-style peak sharpen, clamp to [0,1] after.
+
+5. Perf HUD (I need to SEE it)
+   overlay or stdout each frame:
+     mode, renderWxH, outputWxH, scale, spp, ms trace, ms upscale, ms total
+   If upscale isn’t faster than native at same output size, I can’t tell it works.
+
+--------------------------------------------------
+NATIVE / ADAPTIVE — do not regress
+
+Native:
+  renderW/H = outputW/H
+  no scaler, no CAS unless I pass --cas on a debug flag (default 0)
+  if native { render_native(); present 1:1; return; }
+
+Adaptive:
+  still 1:1 with output UNLESS --mode upscale OR I explicitly pass --scale < 1 with adaptive (out of scope this pass)
+  This pass: --mode upscale uses UNIFORM spp at internal res. Do not combine Adaptive+Upscale yet.
+
+Share Li(), BVH, materials, MIS. Fork only film size + present.
+
+--------------------------------------------------
+DO NOT DO THIS PASS
+- FSR2 / DLSS / XeSS / TAAU / motion vectors / reprojection / frame gen
+- Jittered projection
+- Upscaling noisy HDR without a flag
+- Rendering at output res then “upscaling”
+- Quadtree (B2)
+- Changing default lighting math
+- Making Native go through the scaler at scale=1
+
+--------------------------------------------------
+ORDER
+1. Introduce FilmDesc { renderW, renderH, outputW, outputH, scale }.
+2. Native: render==output, old loop.
+3. Upscale: allocate small HDR film, trace into it, bicubic/EASU to output, CAS, present.
+4. HUD timings.
+5. Stop.
+
+ACCEPTANCE
+- --mode upscale --scale 0.5: obviously softer than native, much cheaper trace, full-size window, not blocky bilinear.
+- --mode native: pixel-identical policy as before this change (1:1, no scaler).
+- --scale 1 with upscale mode: should match native layout (or refuse).
+- Adaptive flags still work; uncombined.
+- I can screenshot internal vs output sizes from the HUD.
+
+OUT OF SCOPE FOLLOW-UP (do not start)
+Temporal: Halton jitter, motion vectors from camera+geom, history HDR, luminance clamp rejection, then upscale. Only after spatial is on screen.
+
+If you mix paths: Native = every output pixel traced, no reconstruct. Upscale = fewer traced pixels, scaler fills the window. I want to see Upscale.

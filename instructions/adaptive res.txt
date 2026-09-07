@@ -1,0 +1,81 @@
+GOAL
+Ship adaptive rendering so I can see it working. Also keep a Native mode I can flip on later: full output resolution, 1:1 pixels, uniform spp, no upscaling, no adaptive scheduling.
+
+I want to LOOK AT Adaptive first. Do not spend the first pass polishing Native. Do not make Adaptive the only path.
+
+--------------------------------------------------
+MODES
+--mode adaptive   ← implement and demo this now (default for this change)
+--mode native     ← must exist and work; can be thin; no adaptive/upsample
+
+CLI examples:
+  --mode adaptive --width 1920 --height 1080 --spp-min 4 --spp-max 64
+  --mode native   --width 1920 --height 1080 --spp 64
+
+If old flags exist, keep them working. New default for THIS change can be adaptive so I see the feature. Native must still be one flag away.
+
+--------------------------------------------------
+DO ADAPTIVE NOW (this is the work)
+
+B1 first — adaptive spp, KEEP 1:1 pixels (no upsample yet)
+- Tiles 16×16.
+- All pixels get spp_min (batches 1,2,4,…).
+- Welford on linear luminance Y = 0.2126R+0.7152G+0.0722B:
+    M += (X-M)/n
+    S += (X-M_old)*(X-M_new)
+    se_rel = sqrt(S/(n-1)) / (sqrt(n)*(M+1e-3))
+- Tile contrast C = (Ymax-Ymin)/(Ymax+Ymin+1e-3)
+- Keep sampling a tile while n < spp_max AND (se_rel > eps OR C > tau OR geo jump: prim id / |Δn| / |Δz|)
+- Compact active tiles each round. Whole tile takes the next batch (no per-pixel warp chaos).
+- Stored mean stays unclamped. Variance test may use a luminance clamp/MAD so fireflies don’t eat the budget.
+- Output = full-res HDR, variable spp, NO holes, NO upsample.
+
+B2 only after B1 looks right — behind --adaptive-res, DEFAULT OFF
+- Coarse 1 ray / 4×4 (or 8×8), quadtree split on contrast/geometry.
+- Reconstruct to full output size with joint bilateral (depth+normal+albedo). Never nearest-neighbor.
+- Native must not enter this path.
+
+Foveation: default OFF.
+
+Post (don’t put in bounce loop):
+- Log-average luminance (downsample OK — this is metering).
+- Pupil: D = clamp(4.9 - 3*tanh(0.4*(log10(Lbar)-0.5)), 2, 8)
+  exposure *= (D/4)^2 * (0.18/Lbar)
+- Bloom: Adaptive may run at 1/4 then add. Native: full res or off.
+- Tone map + sRGB last. Denoise HDR optional, default off.
+
+Share with Native: BVH, materials, NEE/MIS, camera, linear workflow.
+Fork only: pixel scheduling + (optional) reconstruction.
+
+--------------------------------------------------
+NATIVE — option, not the show
+
+When --mode native:
+- Film size == output size. Every pixel traced.
+- Uniform spp. No adaptive spp, no quadtree, no foveation, no tile skip, no upsample, no “adaptive at 100% refinement.”
+- Do not reuse Adaptive’s incomplete buffers.
+- Can be the old main loop behind `if native { render_native(); return; }`
+- If short on time: Native = current uniform renderer unchanged. Adaptive is the new scheduler around the same Li().
+
+Never delete Native. Never silently route Native through Adaptive reconstruct.
+
+--------------------------------------------------
+LIGHTING — don’t regress either mode
+Linear radiance, sRGB decode, area lights + NEE + MIS, GGX + Fresnel + energy-conserving diffuse, RR after min bounce. Pupil is post, not BRDF.
+
+--------------------------------------------------
+ORDER
+1. Wrap current uniform loop as render_native() so Native is one call.
+2. Implement Adaptive B1 (variable spp, full pixel grid). Make this what I see.
+3. Wire --mode adaptive | native.
+4. Stop. Don’t do B2 until I say so.
+
+ACCEPTANCE (Adaptive is the bar)
+- --mode adaptive: I see more samples on lights/edges/penumbrae, fewer on flat walls; full-res image; no upsample.
+- --mode native: 1:1, uniform spp, no adaptive, no upscale. Same Li() as Adaptive.
+- Breaking Adaptive must not destroy Native (early-return Native path).
+
+OUT OF SCOPE THIS PASS
+Quadtree/upsample, foveation, making Native “perfect,” rewriting the integrator.
+
+If you might mix paths: Native = every output pixel traced, uniform spp, no reconstruct. Adaptive = smarter schedule. I want to see Adaptive.

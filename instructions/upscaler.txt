@@ -1,0 +1,230 @@
+TASK: Add output-res PiTSR reconstruct (320p → 1080p/4K without pixelation)
+
+PiTSR exists (CPU, raylib + rlgl + rglfw) but still looks pixelated, bilinear-mush, or smeary on camera turn. You will not rewrite the module and not add GPU compute.
+
+Add the production path: never present the internal RT. Unjittered Lanczos into a display-resolution history, warp with camera-inclusive MVs, then CAS + StableGrain.
+
+Product name stays PiTSR. Folder pitsr/. GL on main thread only.
+0. Why this change exists
+
+A 320p frame stretched with DrawTexture / bilinear is pixelated or blurry. Games avoid that by:
+
+    Jittering the internal camera every frame
+    Reconstructing each display pixel from that jittered grid (Lanczos/EWA)
+    Keeping history at output resolution (UE5 TSR / FSR2)
+    Reprojecting that history with MVs that include camera rotation
+    Sharpen + grain last
+
+Your job is to make PiTSR do exactly that. Internal 320×180 (or whatever) is a sampler, not the image the player sees.
+1. Non-negotiable product rules
+
+    Present only the display-res PiTSR output (UpdateTexture + 1:1 DrawTexturePro). Forbidden: drawing internalRT to the swapchain as the final image.
+    History buffers live at displayW × displayH, not internal res.
+    Current frame is sampled from internal res with jitter invert + Lanczos-2.
+    History is Catmull-Rom gathered from the full plane (camera yaw ≫ tile halo).
+    CPU-only kernels. raylib/rlgl/rglfw: window, RT, readback, upload, HUD.
+    Do not InitWindow / GLFW a second time.
+    Prefer sharp + a little grain over plastic blur. Prefer reject-history over smear.
+
+Target scales: 1.5×, 2×, 3×, and 6× (e.g. 320p→1080p). Must not look like nearest-neighbor blocks at 6× when the camera is still.
+2. Architecture to add (replace amateur upsample)
+text
+Copy
+
+jitter internal camera
+render internalRT (low res)
+export depth + velocity (camera in MVs)
+readback MAIN THREAD
+ingest SoA (internal)
+dilate MV (internal, 3×3)
+FOR EACH DISPLAY tile:
+    src = displayPixel * (iSize/oSize) - jitter     // invert jitter
+    cur = Lanczos2(internal color/depth/mv)         // depth-aware taps
+    histUv = displayPixel - mv * (oSize/iSize)
+    hist = CatmullRom(full hist plane) + depth reject
+    AABB clamp + BATF accumulate at DISPLAY res
+    write out + hist
+optional 1–2 à-trous only on high-var still tiles (do not wipe edges)
+CAS luma + StableGrain
+egress → Image → UpdateTexture(displayTex)
+DrawTexturePro 1:1
+HUD native res AFTER PiTSR
+
+Delete / stop using: bilinear upsample of internal color as the TAA input at internal res then stretch; lerp(prev, cur) in screen space; presenting internal RT.
+3. Buffers to add or resize
+
+Internal iW×iH (inputs only):
+
+    color HDR linear, depth, mv (pixels, internal), optional albedo/normal/roughness/reactive
+
+Persistent display res (ping-pong):
+
+    histY, histCo, histCg (fp16, pre-exposed)
+    histM1, histM2, histP (fp32)
+    histLen (u8)
+    histDepth (fp32 or packed)
+    optional histNormal
+
+Scratch display res: out*, varPre
+Scratch internal: dilated MV
+
+SoA, 64-byte aligned, pitch padded to 8. Print byte counts in pitsr/DESIGN.md.
+On resize: realloc, resample old hist bilinear once, histLen = 0 on novel pixels. Defer free until workers idle.
+
+If current PiTSR stores history at internal res: migrate to display res. That is the feature.
+4. Math to implement (do not stub)
+4.1 Jitter
+
+Halton(2,3), 8–16 period, offset [-0.5, 0.5] internal pixels. Inject into projection before BeginMode3D. Save jittered viewProj as next frame’s viewProjPrev.
+
+Reconstruct:
+text
+Copy
+
+src = (float2(X,Y)+0.5) * (iSize/oSize) - jitterPx
+
+If jitter is 0 or not inverted → pixelation and/or permanent blur. HUD must print jitter.
+4.2 Lanczos-2 current (kills fat pixels)
+
+4×4 taps, w = Lanczos(dx)*Lanczos(dy), a=2.
+Reject taps |Δz| > τz (τ≈0.02).
+Anti-ring: clamp to 3×3 min/max.
+Not bilinear. Not nearest. Not DrawTextureEx scale.
+4.3 Motion vectors (kills turn-smear)
+text
+Copy
+
+world = ReconstructFromDepth(uv, depth, invViewProj)
+mv_internal_px = (ndc_this.xy - ndc_prev.xy) * 0.5 * iSize
+
+Includes camera. Y sign: yaw right → background MV points left in texture space. HUD F3 color wheel. If mean |mv|≈0 while turning, fix this before any filter work.
+
+Convert for history: mv_out = mv_internal * (oSize/iSize).
+Dilate 3×3 longest |mv|, bias min depth.
+
+No depth: homography at focus plane, or whole-frame resetHistory on large camera rotation — never blend unwarped frames.
+4.4 History gather (CPU tile bug)
+
+W2/display pass reads Catmull-Rom from full hist plane. Tile halo is only for AABB/à-trous. Off-screen or border taps → disocclude.
+
+Depth reject: |z - z_reproj| > 0.02*z or normal fail → histLen=0, K=K_MAX, do not lerp smear.
+4.5 AABB + BATF at display res
+
+YCoCg or OKLab. Expand AABB with sqrt(var) and |mv|. Clamp chroma harder than luma.
+text
+Copy
+
+K ∈ [0.12, 0.85] toward CURRENT
+histLen max 16
+if |mv_out|>8  → raise K
+if |mv_out|>12 → cap histLen 4
+if |mv_out|>25 → cap histLen 2
+if histLen<4   → K ≥ 0.5
+
+SpectralBlend: coarse luma may use history; finest band stays close to current (lerp(cur, accum, 0.35) on high freq). Do not TAA reconstructed edges to death.
+
+Demodulate if albedo exists. Firefly: μ+κσ luma.
+4.6 Spatial
+
+At ≥3× scale: 0–2 edge-aware iters max. VAR_FLOOR so you never drive noise to 0. Skip spatial on high |mv| tiles. BudgetGate drops spatial first, never Lanczos/history/CAS/grain.
+4.7 CAS + StableGrain last
+
+CAS luma only, sharpness 0.6–0.9.
+Grain after CAS, luma only, from varPre before spatial, plus GRAIN_MIN so amp never 0. Blue-noise LUT 128², GRAIN_TEMPORAL 0.0–0.2. No rand(). Strength ~0.03.
+
+HUD/UI drawn after PiTSR at native res.
+5. Constants (pitsr_const.h)
+text
+Copy
+
+PITSR_HIST_AT_OUTPUT       1
+PITSR_LANCZOS_A            2
+PITSR_HIST_LEN_MAX         16
+PITSR_K_MIN                0.12
+PITSR_K_MAX                0.85
+PITSR_DEPTH_TAU            0.02
+PITSR_MV_DILATE_R          1
+PITSR_MV_TRUST_PX          8
+PITSR_HIST_CAP_MV12        4
+PITSR_HIST_CAP_MV25        2
+PITSR_ATROUS_ITERS_BAL     2     // 1 at 4×–6× scale
+PITSR_VAR_FLOOR            1.5e-4
+PITSR_CAS_SHARP            0.85
+PITSR_GRAIN_STRENGTH       0.035
+PITSR_GRAIN_MIN            0.008
+
+No lerp(hist, cur, 0.05).
+6. raylib / rlgl wiring
+
+    Internal RenderTexture at iW×iH (float/16F if possible; document fallback).
+    PiTSR_ApplyCameraJitter on Camera3D / projection each frame.
+    Velocity + depth export shader or CPU reconstruct; shaders export only.
+    Persistent Image + Texture2D at oW×oH. UpdateTexture main thread.
+    Resize: rebuild RTs + PiTSR_Resize. DPI-aware DrawTexturePro.
+    Readback ms vs PiTSR ms both in HUD. Keep internal res modest if readback dominates.
+
+7. Scheduling
+
+Same CPU pool. Display-res tiles 32×32. Parallelism across tiles.
+History read-all / write-interior. No GL on workers.
+Double-buffer FramePacket if overlapping. Deterministic tile order.
+8. Debug HUD (mandatory)
+
+F1 internal raw (debug only, not present path)
+F2 PiTSR out
+F3 bilinear stretch of internal (reference — must look worse)
+F4 MV wheel
+F5 histLen
+F6 K
+F7 disocclusion
+F8 varPre / grain amp
+F9 50% split F2 vs F3
+
+Print: jitter, mean |mv|, mean K, mean histLen, scale oW/iW, readback ms, PiTSR ms.
+
+Proof of success: F3 shows pixels/mush; F2 shows edges + grain. While yawing, F4 is a full-screen field, histLen drops, K rises, no grease trails.
+9. Acceptance
+
+    Still, 320p-class → 1080p: not checkerboard; text/decals better than bilinear; grain visible on grey.
+    Fast yaw: sharp-ish, maybe noisier; no 20px smear; no tile seams.
+    Stop turning: histLen climbs ≤16 in ~10 frames.
+    GRAIN_STRENGTH=0: still sharper than bilinear (CAS + Lanczos + K_MIN).
+    UI crisp (drawn after).
+    TSan clean; resize 100× no leak.
+    Still-camera quality from earlier de-blur does not regress.
+
+10. Implementation order (ship this sequence)
+
+A. Stop presenting internal RT. Add displayTex 1:1 blit (even if still bilinear CPU for one commit).
+B. Jitter + invert + Lanczos-2 internal→display (no history). Screenshot vs bilinear.
+C. Velocity HUD; fix units/Y/camera. Dilate MV.
+D. Allocate output-res histories; Catmull-Rom full-plane gather + depth reject.
+E. AABB + BATF + |mv| caps + SpectralBlend.
+F. CAS + StableGrain from varPre.
+G. Demodulate; tiny spatial only if needed. Profiler.
+
+After B pixelation should be gone. After C–E turn-smear should be gone.
+11. Do not
+
+    Do not upsample with raylib bilinear as the product.
+    Do not keep history at 320p and stretch at the end.
+    Do not gather history from tile scratch.
+    Do not add à-trous to hide 320p.
+    Do not denoise in sRGB.
+    Do not filter albedo into lighting.
+    Do not add DLSS/CUDA/frame gen.
+    Do not paste FSR/NRD source.
+
+12. First action
+
+    Inspect current PiTSR: where history lives, how present works, whether jitter/MVs exist.
+    Update pitsr/DESIGN.md with output-res layout, MV units, Y sign, present path.
+    Implement A–C, stop, report HUD numbers (jitter, mean |mv| still vs yaw, F3 vs F2).
+    Then D–F until F3 looks cheap and F2 looks like a reconstructed game image.
+
+Repo stub (fill before paste):
+
+    PiTSR files / present path today:
+    Internal and window size:
+    Depth + MV already exported?:
+    History currently internal or display res?:

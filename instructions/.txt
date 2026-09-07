@@ -1,0 +1,695 @@
+TASK: Build PiTSR — CPU-only temporal super-resolution + denoiser on raylib + rlgl
+
+You are implementing PiTSR (π Temporal Super-Resolution) for our rendering engine.
+
+PiTSR is entirely CPU. No compute shaders, no CUDA, no OpenCL, no fragment-shader blur chain that is the upscaler. raylib / rlgl / rglfw are for window, GL context, low-res scene capture, texture upload, present, input, and debug HUD — not for running the filter.
+
+Do not call InitWindow / GLFW yourself if the engine already owns the window. Use raylib’s bundled GLFW (rglfw). Never create a second GLFW context.
+0. Goal
+
+Internal render (noisy and/or lower res, linear HDR) → stable, sharp, temporally coherent display-res HDR with motion, minimal ghosting, leftover film grain (not plastic blur). Then blit with raylib.
+
+Call it PiTSR in UI, logs, and DESIGN.md. No “Helios”.
+1. Stack (inspect repo, then match it)
+Layer	Role
+raylib	Window, RenderTexture, Image, UpdateTexture, timing, fonts, input
+rlgl	Texture create/format, FBO, readback, rlLoadTexture / rlUpdateTexture / rlReadScreenPixels (or engine equivalents). Optional G-buffer export shaders only
+rglfw	Already inside raylib — do not init GLFW twice
+PiTSR CPU	All TAA / Kalman / SVGF / à-trous / reconstruct / grain
+C++17/20 calling raylib’s C API	No using namespace raylib hacks that break Color
+
+If the project is C-only, implement PiTSR as C11 with a C++ optional SIMD file. Prefer C++ for kernels + extern "C" API.
+
+GL context rule: LoadImageFromTexture, UpdateTexture, FBO binds, BeginTextureMode — main thread only. Worker threads never touch rlgl/GL.
+2. Product requirements
+
+    Upscale 1.0 / 1.5 / 1.7 / 2.0, dynamic internal size.
+    HDR linear + pre-exposure. Working color OKLab or YCoCg. Never denoise after tonemap.
+    Demodulate irradiance when albedo exists.
+    Deterministic at fixed thread count (document 1-ulp SIMD reductions).
+    SIMD: AVX2 + F16C required path, SSE4.2 and scalar fallbacks, optional AVX-512 / NEON.
+    Time-bounded: drop à-trous iters / checkerboard tiles if timeBudgetMs exceeded.
+    Presets: Performance | Balanced | Quality.
+
+Inputs (CPU pointers after ingest)
+
+Required: HDR color, depth, motion vectors, jitter, exposure, viewProj + prev, near/far, frame index, resetHistory.
+
+Optional: prev depth, normals, roughness, albedo, material ID, hitT, reactive/emissive/alpha masks, specular MVs.
+
+If raylib scene has no MVs/depth yet, you must add a G-buffer path (below). Do not silently TAA without velocity (that ghosts).
+Outputs
+
+    Display-res color as raylib Texture2D / RenderTexture2D (and a CPU SoA history)
+    Debug overlay modes
+    FeedbackSPI: quarter-res variance/confidence Image or texture for next-frame sampling
+
+3. raylib / rlgl integration (mandatory design)
+3.1 Frame loop
+text
+Copy
+
+PollInput / UpdateCamera
+jitter projection (Halton then R2)          -- CPU, inject into camera matrix
+BeginTextureMode(internalRT)                -- low internal res
+  draw scene (raylib 3D or your CPU raster)
+EndTextureMode
+export G-buffer if using GPU scene          -- depth, MV, optional albedo/normal
+readback to CPU (pinned/staging Image)      -- MAIN THREAD
+PiTSR_Process(...)                          -- WORKERS, no GL
+tonemap optional on CPU for LDR present
+UpdateTexture(displayTex, pitsrOut)         -- MAIN THREAD
+BeginDrawing
+  DrawTexturePro(displayTex, ..., screen)
+  debug HUD (DrawText, hist length viz)
+EndDrawing
+
+Software-raster engines: skip GPU scene + readback; write straight into PiTSR ingest buffers.
+3.2 Formats
+
+raylib default UNCOMPRESSED_R8G8B8A8 is not the working format.
+
+    Internal scene RT: prefer PIXELFORMAT_UNCOMPRESSED_R16G16B16A16 or R32G32B32A32 via rlgl if the GL driver supports it. If not, render HDR in RGBE / log-luma + chroma or linear u8 only as last resort (document the quality hit).
+    Depth: dedicated RT or rlgl depth texture; export as R32F or packed 24-bit into an Image.
+    MVs: RG16F or RG32F texture → CPU f16/f32 planes.
+    Present: LDR UNCOMPRESSED_R8G8B8A8 after a CPU ACES/Reinhard if the window is 8-bit, or keep float texture if you can blit it.
+
+One ingest convert (tiles, SIMD): engine pixels → SoA working planes. One egress: SoA → packed present buffer. Never convert inside Kalman/à-trous.
+3.3 G-buffer export (only extra shaders allowed)
+
+If scene is raylib GPU 3D, add minimal shaders (rlgl / LoadShader):
+
+    Velocity: clip-pos this vs prev (prevMVP * worldPos) → RG
+    Depth linear or reverse-Z
+    Optional: world/view normal, roughness, albedo
+
+Use MRT if rlgl/GL version allows; else extra passes. These shaders export data; they must not denoise or upsample.
+
+CPU path must still run if shaders missing (depth from Image / CPU camera, MVs from object AABBs or zero + resetHistory on camera cut — last is quality-degraded, log a warning).
+3.4 Readback
+
+    v1: LoadImageFromTexture / rlReadScreenPixels into persistent Image (do not alloc every frame).
+    v2: persistent PBO via rlgl if you can do it without fighting raylib; otherwise stay on sync readback and keep internal res modest.
+    Document: readback will dominate unless internal res is small or the scene is CPU-rendered.
+
+3.5 Window / rglfw
+
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT) as engine policy.
+    On resize: PiTSR_Resize, rebuild RTs with UnloadRenderTexture / LoadRenderTexture, resample history, hist_len = 0 on new pixels.
+    DPI: use GetWindowScaleDPI / render size vs screen size correctly in DrawTexturePro.
+    Do not mix raw glfwCreateWindow with InitWindow.
+
+4. Architecture (visual math = production TSR; execution = CPU wavefront)
+text
+Copy
+
+ingest pack (raylib Image → SoA, pre-expose, demodulate, RGB→OKLab/YCoCg)
+  → tile classify
+  → MV dilate + reactive dilate
+  → reproject + Catmull-Rom history
+  → disocclusion / AABB / luma instability
+  → BATF Kalman accumulate + moments
+  → à-trous / SVGF (2–5 iters)
+  → reconstruct to display (Lanczos-2 / EWA + jitter invert, depth-aware)
+  → CAS luma + blue-noise grain
+  → egress (SoA → present Image) + history commit
+
+Fuse classify + dilate + reproject + Kalman into one tile pass (W2) so color/depth/MV/history stay in L2. À-trous iterations need halo → barrier per iter.
+5. Math (implement, don’t stub)
+
+    Jitter: Halton(2,3) then R2; invert at reconstruct. Apply to raylib camera projection before BeginMode3D.
+    History: Catmull-Rom in OKLab/YCoCg; depth + normal reject.
+    AABB clamp + luma instability (UE5 TSR-style) to grow AABB / process noise.
+    BATF (novel):
+    K = P⁻/(P⁻+R), μ += K(z-μ), P = (1-K)P⁻
+    R = spatial variance + spp proxy; q grows with motion, disocclusion, roughness, hitT.
+    SVGF moments: m1,m2, var = max(0, m2-m1²).
+    Dual EMA: fast (anti-ghost) + slow (anti-flicker).
+    Edge-avoiding à-trous: w_z, w_n, w_luma/sqrt(var), w_mat, w_hit. Holes 1,2,4,…
+    SpectralBlend (novel): more temporal on low-frequency levels, less on high (keeps texture/grain).
+    Demodulate irr = color/max(albedo,ε); skip emissive.
+    Dual lobe (flag): diffuse vs specular histories; specular MVs; anisotropic kernel along reflected-dir × roughness.
+    Disocclusion: dilated MV + bilateral infill + reset length.
+    Fireflies: luma clamp μ + κσ.
+    CAS luma-only in OKLab.
+    Grain: Heitz blue-noise, amplitude ∝ sqrt(leftover var), stable if camera still.
+
+Cite in comments (ideas, no illegal code dumps): SVGF 2017, A-SVGF 2018, Dammertz à-trous, Karis TAA, Yang TAA survey, UE5 TSR, FSR 2.2 algorithm writeups, NRD ReBLUR concepts, Lottes CAS, Kopf JBU, Heitz blue noise.
+6. Memory layout (CPU — this is the job)
+
+Bandwidth wins. No AoS RGB structs in hot loops.
+6.1 Tiles
+
+    Default 32×32 (kTile=32), halo kHalo = (1<<(iters-1)) + 2 (Catmull-Rom/AABB), rounded to SIMD width.
+    Overlapped tiles: job reads tile+halo, writes interior only.
+    Ingest fills clamp-to-edge halo so inner loops have zero bounds branches.
+
+6.2 SoA planes (64-byte aligned, pitch = align(w, 8 or 16))
+text
+Copy
+
+f16  Y, Co, Cg          // working + history color (pre-exposed irradiance)
+f32  depth
+f16  mv_x, mv_y
+f32  m1, m2, P          // moments + Kalman variance (fp32)
+u8   hist_len, reactive, mat_id, tile_class (class is per-tile)
+f16  var
+u16  normal_oct
+
+Ping-pong two history frames. fp16 color, fp32 moments. Print byte estimate in DESIGN.md. Target working set ~80–150 MB at 1080p→1440p.
+
+Arenas:
+
+    persistent — histories
+    scratch[2] — dilated MV, à-trous ping-pong
+    tls[thread] — alignas(64) halo/transpose/grain (no false sharing)
+
+Use raylib MemAlloc or engine aligned malloc (_aligned_malloc / posix_memalign). No new float[w*h] per frame. Defer frees on resize until workers idle.
+6.3 Present buffer
+
+Persistent Image matching displayTex format. UpdateTexture(displayTex, image.data) each frame. CPU 64-byte aligned; copy/swizzle in egress if GL wants tight RGB.
+7. Scheduling (CPU + raylib main thread)
+7.1 Threading
+
+raylib/GL = main. PiTSR tiles = work-stealing pool, N = hardware_concurrency - reservedThreads (default reserve 1 for main).
+
+Do not std::async per tile. Do not OpenMP unless already in-tree. No GL on workers.
+text
+Copy
+
+MAIN:  render internal RT + G-buffer
+MAIN:  readback → FramePacket slot (N%2)
+MAIN:  PiTSR_Enqueue or Process (pool runs W0–W5)
+POOL:  tile jobs
+MAIN:  Wait
+MAIN:  UpdateTexture + DrawTexturePro + HUD
+
+If you overlap next scene while TSR runs: double-buffer FramePacket + output Image. Seqlock/generation counter; no mutex in kernels.
+7.2 Wavefront
+Wave	Work	Sync
+W0	Ingest + tile classify	barrier
+W1	MV dilate (or fuse into W2)	barrier if separate
+W2	Reproject + AABB + BATF (fused)	barrier
+W3i	À-trous iter i	barrier each iter
+W4	Reconstruct + CAS + grain + FeedbackSPI	barrier
+W5	History swap	cheap
+
+BudgetGate: if timeBudgetMs hit after W2, skip remaining W3; history still valid.
+
+TileClass: Sky | StableLowVar | OpaqueMotion | Disocclude | HighVar | Transparent | Emissive
+Skip/cheap à-trous on Sky/Stable. Full path on Disocclude/HighVar. Short history on emissive/alpha.
+
+Job size: 1 tile or strip of 2–4 tiles (~50–200 µs). Parallelism across tiles, never inside a 32×32.
+7.3 SIMD
+
+AVX2 8-wide along X; fp16 load via F16C; à-trous uses regular ±step loads, not gathers. Catmull-Rom may gather. Pad width so no scalar tail. cpuid once; function table Scalar | AVX2 | AVX512. No virtual calls in kernels.
+8. Novel names (must appear in comments)
+
+    BATF — Bayesian/Kalman temporal
+    SpectralBlend — frequency-dependent temporal
+    TileClassWavefront — class drives skipped iters
+    BudgetGate — drop work under ms budget
+    FusedW2 — cache-friendly accumulate
+    SoA fp16 + fp32 moments
+    OverlappedHalo
+    FeedbackSPI
+    StableGrain
+    DualLobe if buffers exist
+
+No ONNX / tiny net in v1.
+9. C API (raylib-friendly)
+cpp
+Copy
+
+struct PiTSR_Buffer {
+  void* ptr; int w, h; int pitchBytes;
+  int format; // raylib PixelFormat or our enum
+};
+
+struct PiTSR_FrameInput {
+  PiTSR_Buffer color, depth, mv;
+  PiTSR_Buffer albedo, normal, roughness, hitT, reactive; // ptr=NULL if absent
+  float jitterX, jitterY, exposure;
+  float viewProj[16], viewProjPrev[16];
+  int frameIndex; bool resetHistory;
+};
+
+struct PiTSR_Config {
+  int internalW, internalH, displayW, displayH;
+  int threads;          // 0 = detect
+  int reservedThreads;  // 1
+  float timeBudgetMs;   // e.g. 8
+  int preset;           // 0 Perf 1 Balanced 2 Quality
+  bool dualLobe, useOKLab, grain, demodulate;
+};
+
+typedef struct PiTSR_Context PiTSR_Context;
+
+PiTSR_Context* PiTSR_Create(const PiTSR_Config*);
+void PiTSR_Resize(PiTSR_Context*, int iW, int iH, int oW, int oH);
+void PiTSR_Process(PiTSR_Context*, const PiTSR_FrameInput*, PiTSR_Buffer* outColor);
+void PiTSR_SetDebug(PiTSR_Context*, int mode);
+void PiTSR_Destroy(PiTSR_Context*);
+
+// raylib helpers (same module)
+bool PiTSR_CreateDisplayTexture(PiTSR_Context*, Texture2D* out);
+void PiTSR_UploadDisplay(PiTSR_Context*, Texture2D tex); // UpdateTexture from last out
+void PiTSR_ApplyCameraJitter(Camera3D* cam, int frameIndex, int internalW, int internalH);
+
+Match existing allocator / math types (Matrix, Vector2) where it reduces glue.
+10. Debug HUD (raylib)
+
+Toggle keys (e.g. F1–F8): raw, history, MV (color wheel), disocclusion, hist length, variance, Kalman K, tile class, split vs bilinear. Draw with DrawTexturePro + DrawText. False-color CPU overlay into out buffer.
+
+Show: ms/wave, tiles skipped, internal→display, preset, readback ms vs TSR ms.
+11. Implementation order
+
+M0 — raylib window (or hook existing), internal RenderTexture, passthrough bilinear CPU upsample, UpdateTexture, HUD fps. Arenas + SoA alloc. Thread pool hello-world.
+M1 — Jittered camera, tiled TAA (reproj, YCoCg AABB, EMA). Scalar then AVX2.
+M2 — Depth+MV export or CPU MVs, dilated MV, disocclusion, hist length, FusedW2.
+M3 — Moments + à-trous 3 iters + halo barriers + TileClass skip sky.
+M4 — BATF + dual EMA + SpectralBlend + BudgetGate.
+M5 — Demodulate, OKLab, CAS, grain, fireflies, DRS resize.
+M6 — fp16 planes, profiler, meet Balanced budget on a documented CPU at 1080p→1440p excluding GL readback (report both).
+M7 — Dual lobe if G-buffer has it; FeedbackSPI; debug vis polish.
+
+After each M: not black, pitsr/DESIGN.md updated, enable steps.
+12. Tests
+
+    Still camera: no crawl; variance falls.
+    Fast pan: no ghost trails.
+    Strafe past occluder: holes ≤2 frames.
+    Strobe emissive: no long afterimage.
+    Resize 100×: no leak, no UAF on ping-pong.
+    ThreadSanitizer clean on pool.
+    Two runs, same thread count: bit-identical or documented SIMD reduction.
+    FLAG_WINDOW_RESIZABLE works.
+
+13. What NOT to do
+
+    Do not implement PiTSR as a blur shader, FBO ping-pong, or rlgl compute.
+    Do not InitWindow twice or init GLFW beside raylib.
+    Do not UpdateTexture / LoadImageFromTexture off the main thread.
+    Do not denoise in SDR / filter albedo into lighting / use white noise as only dither.
+    Do not alloc full-frame vectors per tile per frame.
+    Do not add frame generation.
+    Do not paste FSR/NRD source; algorithms only.
+    Do not rename to Helios.
+
+14. First action
+
+    Inspect repo: existing raylib init, camera, 3D draw, any depth texture, job/SIMD helpers.
+    Write pitsr/DESIGN.md (bytes, tiles, waves, RT formats, who owns InitWindow).
+    Ship M0–M2 with F1 debug (MV + hist length).
+    Stop and summarize: files, keys, missing G-buffer inputs, readback ms vs PiTSR ms.
+
+Then continue M3+ until Balanced is playable.
+
+Repo stub (fill before paste):
+
+    raylib version / InitWindow already exists?:
+    2D or 3D scene / camera type:
+    SIMD / job system already in tree?:
+    Color path today (u8 vs float RT):
+
+Over-blur + dead-flat image is almost always too much history + too fat a spatial kernel + grain applied before the filter (or with amplitude 0). PiTSR should look slightly grainy and sharp, not Vaseline.
+
+Paste this as a fix pass for the agent (do not rebuild from scratch).
+TASK: PiTSR de-blur + StableGrain (quality hotfix)
+
+PiTSR runs but the image is too blurry and has no noise/grain. Do not rewrite the architecture. Do not add GPU compute. Tune + patch the CPU path so it matches CoD/TSR: sharp textures, stable temporal, visible film grain.
+
+Work in pitsr/. Keep raylib/rlgl/rglfw rules: GL on main thread only.
+0. Target look
+
+    Still camera: no crawl, but micro-grain must be visible (especially in mid-greys, RT reflections, GI).
+    Edges, decals, UI-in-world, gun sights: crisp, not smeared.
+    Motion: slight trail is OK; plastic blur is not.
+    Split-screen vs bilinear upsample: PiTSR must be sharper, not softer.
+
+If you have to pick: prefer a little noise over blur.
+1. First 30 minutes — diagnose (mandatory)
+
+Add a F9 split and HUD numbers. Before changing math, dump per-frame:
+
+    mean historyLength
+    mean Kalman K (gain toward current, not history)
+    mean var before spatial, after spatial
+    à-trous iters actually run
+    timeBudgetMs skips
+    whether jitter is non-zero
+    whether grain code path ran (grainAmp mean)
+
+Likely smoking guns (check in this order):
+Symptom Cause
+Everything soft, even still Jitter not in projection, or reconstruct does not invert jitter (you’re box-filtering)
+Soft + no flicker   K too small / hist_len uncapped / EMA α like 0.05 (95% history)
+Textures swim/smear Filtering modulated color (albedo×light) instead of irradiance
+Edges melt, flats OK    à-trous σ_z/σ_n/σ_luma too large, too many iters, no edge stop
+Sharp but plastic, zero grain   Spatial ran until var≈0, then grain ∝ sqrt(var) → 0
+Grain missing entirely  Grain pass never called, or applied before à-trous, or overwritten by egress
+Ghosting and blur   AABB clamp off / too fat + long history
+
+Fix with named constants, not random magic.
+2. Hard rules (break the soup)
+
+    Never denoise/upscale in sRGB/LDR. Linear + pre-expose only.
+    Demodulate if albedo exists: filter irr = color / max(albedo, 0.02), remodulate after. Protect emissive.
+    Frequency split: low frequencies may use long history; high frequencies must not.
+    Spatial filter is allowed to leave noise. Stop when var hits a floor, do not drive it to 0.
+    Grain is last (after reconstruct + CAS), using pre-spatial leftover energy, not post-spatial var≈0.
+    History color resample: Catmull-Rom (or bicubic); display reconstruct: Lanczos-2, not bilinear.
+    Camera must be jittered every frame. If jitter is 0, sharpness cannot be recovered.
+
+3. Parameter reset (replace current knobs)
+
+Put in PiTSRConfig / pitsr_const.h and use them:
+c
+Copy
+
+// Temporal — K is weight of CURRENT sample (higher = sharper, more flicker)
+PITSR_HIST_LEN_MAX        = 16        // was probably 32–64; too high = blur
+PITSR_K_MIN               = 0.12f     // never trust history more than ~88%
+PITSR_K_MAX               = 0.85f     // disocclusion / first frames
+PITSR_K_STILL             = 0.22f     // still camera floor toward current
+PITSR_PROCESS_Q_STILL     = 1e-4f
+PITSR_PROCESS_Q_MOTION    = 0.05f     // per-pixel, scale with |mv| in pixels
+
+// AABB — keep anti-ghost, don't crush detail
+PITSR_AABB_EXPAND_STILL   = 0.5f      // in YCoCg/OKLab units, scaled by sqrt(var)
+PITSR_AABB_EXPAND_MOTION  = 1.5f
+PITSR_INSTABILITY_BOOST   = 2.0f      // grow AABB when luma flickers
+
+// Spatial — fewer, tighter
+PITSR_ATROUS_ITERS_PERF   = 1
+PITSR_ATROUS_ITERS_BAL    = 2         // 3 only on Quality, never 5 on CPU default
+PITSR_ATROUS_ITERS_QUAL   = 3
+PITSR_SIGMA_LUMA          = 0.35f     // smaller = sharper (was likely 1–4)
+PITSR_SIGMA_DEPTH         = 0.5f      // relative
+PITSR_SIGMA_NORMAL        = 16.0f     // pow(dot, sigma); higher = stricter
+PITSR_VAR_FLOOR           = 1.5e-4f   // stop eating noise below this (linear luma^2)
+PITSR_VAR_CEIL            = 0.08f
+
+// Reconstruct / sharpen / grain
+PITSR_LANCZOS_A           = 2
+PITSR_CAS_SHARP           = 0.85f     // luma only; 0.0 was the bug if unset
+PITSR_GRAIN_STRENGTH      = 0.035f    // visible at 1080p
+PITSR_GRAIN_RESPONSE      = 0.15f     // more grain in mid-grey, less in peaks
+PITSR_GRAIN_MIN           = 0.008f    // **floor so grain never dies**
+PITSR_GRAIN_TEMPORAL      = 0.15f     // 0 = frozen grain (stable), 1 = boiling
+
+If current code uses out = lerp(hist, cur, 0.05): delete it. Use BATF with K ∈ [K_MIN, K_MAX].
+4. Math patches (implement exactly)
+4.1 Jitter invert (if missing, this alone causes blur)
+
+Projection jitter in pixels: j = Halton/R2 ∈ (-0.5, 0.5).
+
+Reconstruct at display pixel p using kernel centered at
+p_src = (p + 0.5) * (internal/display) - jitter_px.
+
+If you upsample after TAA without subtracting jitter, you get a 1-pixel box filter forever.
+4.2 BATF — bias toward current when variance is already low
+text
+Copy
+
+R  = max(var_spatial, PITSR_VAR_FLOOR)     // measurement noise
+q  = Q_STILL + Q_MOTION * saturate(|mv| / 4.0) + disocclusion*0.2
+P- = P_hist + q
+K  = clamp(P- / (P- + R), K_MIN, K_MAX)
+if (hist_len < 4) K = max(K, 0.5)
+if (still && var < VAR_FLOOR*4) K = max(K, K_STILL)  // don't over-smooth clean pixels
+μ  = hist + K * (z - hist)
+
+SpectralBlend: after à-trous iteration i (0 = finest):
+
+K_i = K * pow(0.5, i) applied only to the band (this iter residual),
+or simpler v1: temporal blend only the coarsest à-trous level; finest level = lerp(cur, filtered, 0.35).
+
+This is the #1 de-blur trick: do not TAA the high frequencies to death.
+4.3 AABB must expand with variance
+
+Tight AABB + noisy RT = flicker. Fat AABB + long history = blur.
+
+aabb_expand = (still ? 0.5 : 1.5) * (sqrt(var) + 1e-3) in luma.
+Clamp chroma harder than luma (luma carries detail).
+4.4 À-trous: edge stop + early out
+
+Weight:
+
+w = w_z * w_n * w_l * w_mat
+w_l = exp(-|ΔY| / (SIGMA_LUMA * sqrt(max(var, VAR_FLOOR)) + 1e-4))
+
+    If var < VAR_FLOOR skip remaining iters for that tile (TileClass StableLowVar).
+    Performance preset: 1 iter. Balanced: 2.
+    Do not increase hole size past 4 on Balanced (1, 2 only).
+
+4.5 Dual history (if you already have it)
+
+Output = lerp(slow, fast, saturate(instability + motion)).
+Fast τ ≈ 4 frames, slow τ ≈ 12. Using only slow = blur.
+4.6 Sharpen after reconstruct, luma only
+
+CAS (Lottes) on OKLab/Y L, then put chroma back.
+sharpness = PITSR_CAS_SHARP (0.85). HDR: sharpen pre-exposed luma, clamp to avoid ringing on fireflies.
+
+If CAS is missing, image will always look like TAA soup.
+4.7 StableGrain — why you have “no noise”
+
+Bug: amp = strength * sqrt(var_after_filter) → 0.
+
+Fix: store var_pre before à-trous (tile or pixel). Grain last:
+text
+Copy
+
+Y = OKLab_L or luma
+// mid-grey emphasis (simple)
+t = saturate(Y / (Y + 0.18))           // not physically film, looks filmic enough
+amp = GRAIN_STRENGTH * mix(GRAIN_MIN, sqrt(max(var_pre, VAR_FLOOR)), 0.65)
+amp *= mix(1.0, GRAIN_RESPONSE + t, 0.5)
+
+// blue noise, NOT white, NOT hashed every frame at full strength
+n = BlueNoise2D((px, py) + floor(frame * GRAIN_TEMPORAL))   // [-0.5, 0.5], triangular if possible
+n = n + BlueNoise2D(...) * 0.5  // 2-tap tri pdf optional
+
+Y' = Y + amp * n
+
+Rules:
+
+    Add grain in luma only, linear/pre-exposed, after CAS.
+    GRAIN_TEMPORAL = 0.0–0.2 so still camera is stable grain, not TV static.
+    If no blue-noise texture yet: bake a 128² void-and-cluster table as a static const u8[] (do not rand()).
+    Never run grain through à-trous.
+
+Optional noise floor (very CoD): even if var_pre is tiny, amp >= GRAIN_STRENGTH * GRAIN_MIN.
+5. Reconstruction (kill bilinear)
+
+Display upsample:
+
+    Lanczos-2 (or EWA) with jitter invert.
+    Depth-aware: reject taps where |Δz| > τ z (don’t mix fg/bg).
+    Anti-ring: clamp Lanczos negative lobes against 3×3 neighborhood min/max (mild).
+
+If reconstruct is DrawTextureEx bilinear from internal RT, you are presenting a blurry buffer. Egress CPU buffer must already be display res.
+6. TileClass / BudgetGate
+
+BudgetGate must not skip sharpen+grain. If time is tight: drop à-trous first, never drop CAS/grain.
+
+StableLowVar: 0 spatial iters, still grain+CAS.
+That single change often fixes plastic look.
+7. Debug HUD (raylib)
+
+F1 raw internal, F2 PiTSR out, F3 bilinear-only upscale, F4 hist_len, F5 K, F6 var_pre, F7 grain amp, F8 split 50%.
+
+Print: blurIndex = mean(hist_len) * atrousIters * (1-meanK) — if blurIndex > ~8, you are in soup.
+8. Acceptance
+
+    Still camera, 2× upscale: text/decals readable; grain visible at 100% zoom on a grey wall.
+    F3 bilinear vs F2 PiTSR: PiTSR sharper.
+    Fast pan: no 20px trails.
+    Disocclusion: no black smear >2 frames.
+    Turning GRAIN_STRENGTH=0 makes it cleaner but still sharp (CAS+K_MIN doing the work). Grain is not a crutch for blur.
+
+9. Order of work
+
+    Prove jitter in + jitter invert + Lanczos (screenshot HUD jitter values).
+    Clamp hist_len, raise K_MIN, cut à-trous to 2.
+    SpectralBlend or “TAA only coarse level”.
+    CAS.
+    Grain from var_pre + GRAIN_MIN + blue-noise LUT.
+    Demodulate if albedo exists.
+    Stop. Paste before/after notes in pitsr/DESIGN.md (knobs changed, ms).
+
+10. Do not
+
+    Do not add more à-trous iters “to kill noise”.
+    Do not increase history length.
+    Do not Gaussian-blur then overlay cheap grain — that’s the plastic look.
+    Do not filter in gamma.
+    Do not rand() per pixel per frame as grain.
+
+TASK: PiTSR — kill camera-turn smear (MV + gather + trust-current)
+
+Turning/panning the camera makes PiTSR blurry/smeary. Standing still is OK (or better). That means temporal reprojection is wrong under large screen-space motion, not “need more blur.”
+
+CPU-only, raylib/rlgl/rglfw unchanged: no GL on workers.
+0. What “blurry when turning” actually is
+
+You are averaging this frame with history that is not the same surface. It looks like motion blur.
+
+Priority order (fix in this order — 1 and 2 are the usual killers in this CPU tiled design):
+
+    History resample is a full-screen gather, not a tile-halo load
+    MVs include camera rotation and are in pixels, correct Y sign
+    Depth reject + dilated MV on disocclusion
+    Trust current when |mv| is large (K up, hist_len down)
+    AABB + instability so you don’t keep smeared history
+
+Do not add à-trous iters. Do not raise HIST_LEN_MAX.
+1. Diagnose in 20 minutes (HUD, F-keys)
+
+Print per frame (and false-color):
+HUD Healthy still   Healthy turn    Broken turn
+mean |mv| (pixels)  ~0–0.5 (jitter only)    10–80+  ~0 → MVs missing
+mean hist_len   8–16    drops to 2–6    stays 16 → smear
+mean K (toward current) ~0.2    0.4–0.8 stays 0.1 → smear
+% depth-reject  ~1–5%   10–40%  0% → mixing walls
+% gather clamped to halo/edge   0   0   >0 → tiled gather bug
+
+F3 MV color wheel (red=right, green=up). On a yaw right:
+
+    Whole screen should show a coherent field (background larger MV than near objects).
+    If MV is black/zero except on moving props: camera velocity not in the buffer — this is the bug.
+    If field is inverted (yaw right, arrows left): sign/Y flip.
+    If field is tiny while the image jumps a lot: units wrong (NDC vs pixels, or forgot resolution scale).
+
+F4 hist_len, F5 K, F6 disocclusion mask, F7 split: left = PiTSR, right = current frame only (no history).
+If right is sharp (blocky/noisy) and left is smeared while turning → history path is guilty, not raster.
+
+Log three numbers from one yaw: mv_px, jitter_px, internal_size. If mv_px < 1 while the view rotates ~10°, stop and fix MV export before any filter tweak.
+2. Bug A (most likely on PiTSR-CPU): halo gather
+
+À-trous halo (8–10 px) is not enough for reprojection. Camera yaw moves pixels tens of pixels. If W2 only reads tile+halo of history, samples clamp inside the tile → smear / trails / tile crawling only when turning.
+
+Rule:
+
+    Spatial (AABB 3×3, à-trous): tile + halo
+    History resample: hist[x - mv.x, y - mv.y] from the full history plane (random access, Catmull-Rom 4×4). Any thread may read all of history. Only write the tile interior.
+
+Implementation:
+
+    History buffers = shared SoA, immutable during W2.
+    Do not memcpy history into the tile scratch except optional prefetch of a bounding box of the 4×4 taps if you want (bbox = tile expanded by max|mv| in that tile + 2). If max|mv| > 64, skip the copy and gather from the plane.
+    Edge: clamp UV to 0.5 .. w-1.5 for Catmull-Rom, and mark those pixels disoccluded (don’t keep stretched border history).
+
+If you used overlapped tiles to “avoid gathers,” revert that for W2 only.
+3. Bug B: motion vectors don’t include the camera
+
+raylib scenes often export object velocity = 0. Camera turn then has MV = 0 → TAA stacks unwarped frames → look-smear.
+
+Every pixel:
+text
+Copy
+
+p  = this-frame clip / NDC / screen
+p' = prevViewProj * worldPos     // same world position
+mv_px = (p.xy - p'.xy) * 0.5 * internalResolution   // if p in NDC [-1,1]
+
+    Use this-frame depth to reconstruct world pos (view or clip).
+    prevViewProj = last frame’s jittered VP if you jittered last frame (match what was actually rendered).
+    Y sign: GL NDC Y vs texture Y. One flip is enough to smear. Test: yaw right → background MV must point left in texture space (old pixels come from the right). If opposite, negate mv.x or mv.y.
+    Units: pixels in internal res, not display, not UV[0,1] unless every resample agrees. Pick pixels; convert once at ingest.
+    Jitter: mv is surface motion only. Do not bake current jitter into MV; jitter is handled in reconstruct. If both are applied, you get extra blur.
+
+If you have no depth: you cannot reproject a 3D camera. Fallback (better than smear):
+
+    Compute a 2D homography from inv(viewProj) * prevViewProj at z = z_focus (camera forward plane) and use that as MV.
+    Or: if |camera_rotation| > ε and no depth/MV, resetHistory on the whole frame (sharp, noisy) until G-buffer exists. Smear is worse than a hard cut.
+
+Dilate MV (FSR2-style): 3×3 (or 5×5 on Quality) longest screen motion in the neighborhood (and slightly toward min depth / foreground). Stops edges leaving trails when turning.
+4. Bug C: depth reject off → walls smear onto each other
+
+When turning, almost every silhouette is a disocclusion.
+
+Reject history if any:
+text
+Copy
+
+|z - z_reproj| > τ * z          τ ≈ 0.01–0.03, loosen a bit with |mv|
+dot(n, n_hist) < 0.8            if normals exist
+reprojected sample out of screen
+reactive / alpha
+
+On reject: hist_len = 0, K = K_MAX (~0.85), do not lerp with stale color. Fill from current + short bilateral if you want; never keep the smeared tap.
+
+Reverse-reproject with dilated MV first (FSR2). If still fail, reset.
+5. Bug D: Kalman still trusts a long history while |mv| is huge
+
+Even with perfect MVs, 16-frame EMA looks like motion blur.
+text
+Copy
+
+mv = length(mv_px)
+q  = Q_STILL + Q_MOTION * saturate(mv / 4.0)     // Q_MOTION ~ 0.08–0.15
+     + 0.25 * disoccluded
+K  = clamp(P- / (P- + R), K_MIN, K_MAX)
+K  = max(K, saturate(mv / 8.0))                  // turn → trust current
+if (mv > 12.0) hist_len = min(hist_len, 4)
+if (mv > 25.0) hist_len = min(hist_len, 2)
+
+SpectralBlend: under motion, do not temporally accumulate the finest à-trous band. Finest = mostly current. History only on coarse luma.
+
+AABB: expand with sqrt(var) and |mv|, but luma clamp must still cut trails on high-contrast edges (sky vs gun). If you disabled AABB to “fix flicker,” turn smear comes back — restore AABB, expand it; don’t delete it.
+6. Bug E: reconstruct / jitter double-filter during motion
+
+    Display upsample is Lanczos-2 at display res, jitter inverted, depth-aware taps.
+    Do not also DrawTextureEx bilinear the internal RT on top.
+    Do not add extra blur “for motion.” PiTSR is not motion blur unless the camera explicitly asks for it.
+
+CAS stays on; BudgetGate may drop à-trous, never drop MV resample correctness.
+7. Constants (turn-specific; keep de-blur set)
+text
+Copy
+
+PITSR_HIST_LEN_MAX           16
+PITSR_HIST_LEN_CAP_MV12      4
+PITSR_HIST_LEN_CAP_MV25      2
+PITSR_K_MIN                  0.12
+PITSR_K_MAX                  0.85
+PITSR_MV_TRUST_CURRENT_PX    8.0     // |mv| at which K is forced up
+PITSR_DEPTH_TAU              0.02
+PITSR_MV_DILATE_R            1       // 3×3; 2 on Quality
+PITSR_GATHER_BORDER_REJECT   1       // hist tap in 1px border → disocclude
+
+8. Code structure (where to patch)
+
+    pitsr ingest — MV decode to pixel space, Y flip once, HUD.
+    W1 — MV dilate on full plane (small halo is OK here: 1–2 px).
+    W2 — full-plane Catmull-Rom gather + depth reject + BATF with |mv| caps. No tile-local history.
+    Camera / raylib — prevViewProj saved after jitter; G-buffer velocity shader uses it.
+    HUD — F3–F7 as above.
+
+9. Acceptance
+
+    Yaw/pitch at moderate mouse speed: edges stay sharp, no 20px grease trails.
+    F3 MV field is full-screen and points the right way.
+    hist_len falls while turning, climbs when you stop (within ~10 frames).
+    F7: PiTSR ≈ current-frame sharpness under fast turn (a bit of grain/flicker OK); when still, PiTSR is cleaner than current.
+    Tile seams do not appear only when turning (that was halo gather).
+    Still-camera grain/sharpness from the previous hotfix must not regress.
+
+10. Do not
+
+    Do not blur more to hide trails.
+    Do not reset history every frame (that’s no TAA). Reset only on teleport / missing MV+depth.
+    Do not gather history from tile scratch.
+    Do not mix display-res and internal-res MVs.
+    Do not skip depth reject “because it flickered.”
+
+11. First action
+
+    Screenshot F3 MV while yawing. If MV≈0, fix prevViewProj × worldPos (or whole-frame reset until depth exists).
+    Grep W2 history loads: if they use tile buffers, switch to full-plane gather.
+    Add |mv| caps on K / hist_len.
+    Dilate MV + depth reject.
+    Stop. Write 10 lines in pitsr/DESIGN.md: MV units, Y sign, gather change, HUD proof.
+

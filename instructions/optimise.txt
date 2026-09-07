@@ -1,0 +1,103 @@
+You are accelerating my existing raytracer on a Dell Latitude 7480.
+Hardware (do not assume otherwise)
+
+    CPU: Intel 7th-gen Kaby Lake U, 2 cores / 4 threads (i5-7300U / i7-7600U class). AVX2, no AVX-512.
+    GPU: Intel HD Graphics 620, ~24 EUs, no RT cores, no CUDA, no OptiX, no DXR.
+    Shared system memory (UMA). PCIe copies are pointless; bandwidth is the bottleneck.
+    APIs: OpenCL (Intel HD 620 is OpenCL 1.2 / 2.0). Use Intel OpenCL CPU device only if it beats native threads—prefer native CPU threads + SIMD for the CPU path.
+    OS: detect Windows vs Linux; Intel NEO / Beignet / Intel CPU Runtime as available. Feature-detect; do not require OpenCL 3.0 or Arc-only extensions.
+
+Goal
+
+Faster render, same quality. Same camera, SPP, bounces, BRDFs, lights, filtering. Same RNG per pixel/path. No denoisers, no fewer rays, no approximate hits, no Russian-roulette / early-kill changes.
+
+Visually identical is required. Tiny FP differences from reorder/OpenCL vs CPU math are OK. Keep a CPU naive vs accelerated A/B path to compare images.
+Architecture: heterogeneous CPU + OpenCL GPU
+
+Do not put 100% of rays on HD 620. That iGPU is weak and hates incoherent traversal. Use:
+
+    CPU = primary engine (threads + BVH + SIMD).
+    OpenCL GPU = extra workers on independent image tiles, same BVH, same shading rules.
+    Dynamic load balance so the 4 CPU threads and the iGPU finish together.
+
+Shared design
+
+    Split the image into 16×16 or 32×32 tiles (tune; Intel often likes 8×8 or 16×16).
+    One lock-free / mutex work queue of tile IDs (Morton order). CPU threads pop tiles. GPU pops batches of tiles per kernel launch (e.g. 4–16 tiles) to amortize launch overhead.
+    When the GPU is slower, it simply takes fewer tiles. Never stall the CPU waiting on the GPU except a final join.
+    Same scene, same BVH layout in a format both can read.
+    Zero-copy:
+        CL_MEM_ALLOC_HOST_PTR / USE_HOST_PTR / OpenCL 2.0 SVM if available.
+        Map buffers; do not clEnqueueWriteBuffer the whole scene every frame.
+        Framebuffer: GPU writes its tiles into a shared image; CPU writes its tiles. No full-frame round trip.
+    BVH build on CPU only. Upload/share nodes once (static) or on scene change. GPU never builds the tree unless you later prove it is faster (it will not be on HD 620).
+
+CPU path (mandatory, must work with GPU disabled)
+
+    Replace naive O(n) intersection with a SAH BVH. Prefer Intel Embree if the project can take a dependency; otherwise hand-rolled binary or 4-wide SAH BVH.
+    3–4 worker threads (leave ~0–1 logical core if GPU driver needs it; benchmark 3 vs 4).
+    AVX2 / packets for primary rays if practical; scalar Embree/intersect is OK first.
+    No per-ray heap allocs. Compact ray struct. No virtual calls in the hit loop.
+    Static scene: build once. Instance/refit if transforms change.
+
+OpenCL GPU path (optional device, required code path if a GPU device exists)
+
+    Query platforms/devices; pick Intel GPU. If no GPU OpenCL, run CPU-only and still be correct.
+    Iterative traversal only (no recursion in kernels). Stackless BVH or a small explicit stack in private/local memory (depth cap, e.g. 64).
+    Work-item = one pixel (or one small packet). Workgroup size 16 or 32 (Intel). Avoid 1024.
+    Coherent primary rays first. Secondary/path bounces: only if already in the CPU tracer; keep kernels simple. If path tracing: wavefront-style kernels (generate / intersect / shade) rather than one giant megakernel with huge register pressure.
+    Data: SoA or packed 32-byte AABB nodes; float3 + padding; avoid pointer graphs in GPU memory—index-based nodes.
+    Divergence: do not rely on hardware SER (none). Optional: process a tile’s pixels in Morton order inside the kernel.
+    Precisely match CPU intersection policy (watertight tests if CPU has them; same tmin/tmax/culling).
+    Shading: port the same BRDF/lights or share via common headers. If shading is huge, GPU traces visibility/primary hits and CPU shades—only if that is simpler and still faster; prefer full per-tile path on GPU for primary/Whitted.
+
+Load balancing
+
+    Start GPU kernel on a batch; CPU threads keep stealing tiles.
+    If GPU kernel overruns, shrink batch next frame.
+    Log: tiles CPU vs GPU, ms build, ms trace, device names.
+    Heuristic start: ~70–90% tiles CPU, 10–30% GPU, then adapt. HD 620 may lose to 4 AVX2 threads—keep GPU only if it reduces wall time. If GPU is net slower (driver + occupancy), auto-disable after a probe render.
+
+Quality / correctness
+
+    Per-pixel RNG seed = hash(pixel, sample, bounce) or existing scheme—not work-item id that changes with device.
+    Identical SPP/depth/lights.
+    Compare RMSE/MAE or flip A/B vs CPU-only accelerated and vs original naive.
+    Handle GPU denorms / -cl-fast-relaxed-math: do not enable fast-math if it changes hits; optional flag, off by default.
+
+Do not
+
+    Require RTX, CUDA, OptiX, Vulkan RT, Arc, or Intel Xe-HPG.
+    Rewrite the app in GLSL “for fun.”
+    Reduce SPP/resolution/bounces to look faster.
+    Neural / ReSTIR / denoiser / radiance cache.
+    Copy the scene every tile.
+    One OpenCL work-item per entire image.
+    Recursion, dynamic stack malloc, or virtual functions in kernels.
+    Block the UI thread; keep build+trace cancellable if the app has a UI.
+
+Integration
+
+    Fit the current repo (language, build, scene format). Minimal API: buildAccel(scene), render(buffer) with devices: CPU, GPU, BOTH.
+    CMake/msbuild: optional OpenCL (ICD loader). #ifdef HAS_OPENCL.
+    Runtime: --device=cpu|gpu|both, --tile=16, --threads=3.
+    If C++: Embree + OpenCL ICD is the preferred stack. If no extra deps: hand SAH BVH + OpenCL.
+
+Implementation order
+
+    Inspect repo: ray loop, primitives, RNG, build system.
+    CPU SAH BVH + tiled threads. A/B image + time.
+    OpenCL device init, zero-copy framebuffer, one primary-ray kernel on a few tiles (CPU still does the rest).
+    Share BVH buffers; GPU intersect matches CPU.
+    Dynamic tile queue CPU+GPU; autotune batch; disable GPU if no speedup.
+    Only then: secondary rays / wavefront on GPU.
+
+Done when
+
+    CPU-only accelerated path is correct and faster than naive.
+    both uses OpenCL on HD 620 and CPU tiles without tearing/races.
+    Wall-clock on a representative scene reported: naive CPU vs BVH CPU vs CPU+GPU, plus GPU tile fraction.
+    GPU absence → automatic CPU fallback.
+    Short README: build flags, Intel OpenCL runtime notes (Windows: Intel Graphics driver; Linux: intel-opencl-icd), how to A/B.
+
+Start by listing devices (clinfo / enumerated OpenCL) and the tracer’s current intersection loop. Then implement CPU BVH+tiles before any kernel.

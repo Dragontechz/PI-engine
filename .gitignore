@@ -1,0 +1,8 @@
+build/
+*.o
+*.obj
+world_viewer.png
+saves/
+
+*.exe
+*.log
