@@ -20,4 +20,11 @@ int GpuRenderer_Render(GpuRenderer *gpu, const Scene *scene, unsigned char *rgb,
 
 void GpuRenderer_Destroy(GpuRenderer *gpu);
 
+/* Share raylib's texture with the OpenCL device for zero-copy presentation
+ * (no readback, no UpdateTexture). Returns 0 when interop is unavailable. */
+int GpuRenderer_AttachGlTexture(GpuRenderer *gpu, unsigned tex_id, int width, int height);
+
+/* Non-zero while Ocl_Render presents straight into the attached texture. */
+int GpuRenderer_GlInterop(GpuRenderer *gpu);
+
 #endif

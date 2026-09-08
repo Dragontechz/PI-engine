@@ -199,7 +199,7 @@ int main(int argc, char **argv) {
     int device = 1;         /* 0 = cpu, 1 = gpu, 2 = both (hybrid tiles) */
     int spp_min = 4;
     int spp_max = 16;
-    float scale = 0.67f;    /* upscale mode: internal = output * scale */
+    float scale = 0.58f;    /* upscale mode: internal = output * scale */
     float cas = 0.4f;       /* upscale mode: CAS sharpen after upscale */
     int uniform_spp = 0;    /* upscale/native mode: explicit --spp */
     for (int i = 1; i < argc; i++) {
@@ -285,7 +285,11 @@ int main(int argc, char **argv) {
     Texture2D texture = LoadTextureFromImage(image);
     free(texture_data);
     SetTextureFilter(texture, TEXTURE_FILTER_POINT);
-    GpuRenderer *gpu = device == 1 && use_gpu ? GpuRenderer_Create(MAX_RENDER_W, MAX_RENDER_H) : NULL;
+    /* device 1 = GPU-only, device 2 = hybrid for native mode but still GPU
+     * for adaptive/upscale modes (hybrid renders full-res tiles only). */
+    GpuRenderer *gpu = device >= 1 && use_gpu ? GpuRenderer_Create(MAX_RENDER_W, MAX_RENDER_H) : NULL;
+    if (gpu)
+        GpuRenderer_AttachGlTexture(gpu, (unsigned)texture.id, MAX_RENDER_W, MAX_RENDER_H);
     V3 *hdr_film = NULL;
     int hybrid_ready = 0;
     if (device == 2) {
@@ -299,6 +303,7 @@ int main(int argc, char **argv) {
     }
     int show_help = 1;
     int startup_screenshot_saved = 0;
+    int profile = getenv("RT_PROFILE") != NULL;
     double render_ms = 0.0;
     int frame_index = 0;
 
@@ -323,7 +328,10 @@ int main(int argc, char **argv) {
         int frame_w = MAX_RENDER_W;
         int frame_h = MAX_RENDER_H;
         int gpu_used = 0;
-        if (hybrid_ready && !adaptive) {
+        double t_render = 0.0, t_present = 0.0;
+        /* Hybrid tiles are a native-res feature; upscale mode must keep the
+         * reduced-res GPU path (hybrid at 1280x720 is CPU-bound). */
+        if (hybrid_ready && !adaptive && !adaptive_res) {
             /* Hybrid: GPU pops a tile batch, OpenMP workers trace the rest,
              * shared CPU post chain tone maps the joined HDR film. */
             if (rt_render_hybrid_hdr(&scene, hdr_film, frame_w, frame_h,
@@ -334,20 +342,36 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "viewer: hybrid path failed, falling back\n");
             }
         }
-        if (!gpu_used) gpu_used = gpu && GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
+        if (!gpu_used) {
+            double gq0 = GetTime();
+            gpu_used = gpu && GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
                                                  internal_w, internal_h, frame_spp, cas);
+            if (profile && (frame_index <= 5 || frame_index % 30 == 0))
+                fprintf(stderr, "prof: GpuRenderer_Render %.1f ms\n",
+                        (GetTime() - gq0) * 1000.0);
+        }
         if (!gpu_used && !render_parallel(&scene, rgb, frame_w, frame_h, adaptive, adaptive_res,
                                           spp_min, spp_max)) {
             TraceLog(LOG_ERROR, "Ray-traced frame failed");
             break;
         }
         (void)frame_index++;
-        render_ms = (GetTime() - start) * 1000.0;
+        t_render = (GetTime() - start) * 1000.0;
+        render_ms = t_render;
+        double t0p = GetTime();
+        /* With CL-GL interop the GPU already wrote the shared texture. */
+        if (!(gpu_used && GpuRenderer_GlInterop(gpu)))
+            present_rgb(texture, rgb, rgba, frame_w, frame_h);
+        t_present = (GetTime() - t0p) * 1000.0;
+        if (profile && (frame_index <= 5 || frame_index % 30 == 0)) {
+            fprintf(stderr, "prof frame %d: render %.1f (gpu=%d) present %.1f total %.1f ms\n",
+                    frame_index, t_render, gpu_used, t_present,
+                    (GetTime() - start) * 1000.0);
+        }
         if (frame_index % 30 == 0 || frame_index <= 3) {
             TraceLog(LOG_INFO, "frame %d: %.1f ms (%.1f fps)", frame_index, render_ms,
                      render_ms > 0.0 ? 1000.0 / render_ms : 0.0);
         }
-        present_rgb(texture, rgb, rgba, frame_w, frame_h);
 
         BeginDrawing();
         ClearBackground((Color){8, 10, 14, 255});

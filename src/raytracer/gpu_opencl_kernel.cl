@@ -13,6 +13,28 @@
 #define EPS 1e-5f
 #define MAX_DEPTH 4
 
+/* Per-frame scalar block (see OCL_FRAME_* in gpu_opencl.c). Every value the
+ * trace kernels need that changes per frame travels through one buffer, so
+ * kernel args are bound once and SetKernelArg never runs in the frame loop
+ * (it costs ~3 ms per call on 51-arg kernels with the Gen9 driver). */
+#define F_CAM 0
+#define F_FWD 4
+#define F_RIGHT 8
+#define F_UP 12
+#define F_ASPECT 16
+#define F_W 20
+#define F_H 21
+#define F_SPP 22
+#define F_COUNTS 24
+#define F_TRI 28
+#define F_LIGHTS 29
+#define F_FOG 32
+#define F_SUN_DIR 36
+#define F_SUN_COL 40
+#define F_BMAT 44
+#define F_BEMI 48
+#define FRAME_FLOATS 52
+
 struct Hit { float t; float3 n; int kind; int idx; };
 
 float clamp01(float x) { return clamp(x, 0.0f, 1.0f); }
@@ -631,12 +653,7 @@ float3 path_pixel(const int x, const int y, const int W, const int H,
     return result / (float)sample_count;
 }
 
-__kernel void rt_main(__global float4 *out, const int W, const int H,
-                      const int spp,
-                      const float4 cam_pos, const float4 fwd, const float4 right,
-                      const float4 up, const float2 aspect_tan, const int4 counts,
-                      const int tri_count, const int light_count,
-                      const float4 fog, const float4 sun_dir, const float4 sun_col,
+__kernel void rt_main(__global float4 *out, __global const float *frame,
                       __global const float4 *sph, __global const float4 *sph_mat,
                       __global const float4 *sph_emi,
                       __global const float4 *sph_texA, __global const float4 *sph_texB,
@@ -653,11 +670,27 @@ __kernel void rt_main(__global float4 *out, const int W, const int H,
                       __global const float4 *lrad,
                       __global const float *tris,
                       __global const float4 *grid_a, __global const uint4 *grid_dims,
-                      __global const uint *grid_off, __global const uint *grid_tri,
-                      const float4 bunny_mat, const float4 bunny_emi) {
+                      __global const uint *grid_off, __global const uint *grid_tri) {
+    const int W = (int)frame[F_W], H = (int)frame[F_H];
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
     if (x >= W || y >= H) return;
+
+    const float4 cam_pos = vload4(0, frame + F_CAM);
+    const float4 fwd = vload4(0, frame + F_FWD);
+    const float4 right = vload4(0, frame + F_RIGHT);
+    const float4 up = vload4(0, frame + F_UP);
+    const float2 aspect_tan = (float2)(frame[F_ASPECT], frame[F_ASPECT + 1]);
+    const int4 counts = (int4)((int)frame[F_COUNTS], (int)frame[F_COUNTS + 1],
+                               (int)frame[F_COUNTS + 2], (int)frame[F_COUNTS + 3]);
+    const int tri_count = (int)frame[F_TRI];
+    const int light_count = (int)frame[F_LIGHTS];
+    const float4 fog = vload4(0, frame + F_FOG);
+    const float4 sun_dir = vload4(0, frame + F_SUN_DIR);
+    const float4 sun_col = vload4(0, frame + F_SUN_COL);
+    const float4 bunny_mat = vload4(0, frame + F_BMAT);
+    const float4 bunny_emi = vload4(0, frame + F_BEMI);
+    const int spp = (int)frame[F_SPP];
 
     float3 result = path_pixel(x, y, W, H, spp,
                                cam_pos, fwd, right, up, aspect_tan, counts,
@@ -679,12 +712,7 @@ __kernel void rt_main(__global float4 *out, const int W, const int H,
  * its pixels into the same film layout as rt_main; the host composites
  * CPU and GPU tiles and runs the shared post chain. Uses the CPU RNG
  * scheme (per_sample_seed = 1). */
-__kernel void rt_tiles(__global float4 *out, const int W, const int H,
-                       const int spp,
-                       const float4 cam_pos, const float4 fwd, const float4 right,
-                       const float4 up, const float2 aspect_tan, const int4 counts,
-                       const int tri_count, const int light_count,
-                       const float4 fog, const float4 sun_dir, const float4 sun_col,
+__kernel void rt_tiles(__global float4 *out, __global const float *frame,
                        __global const float4 *sph, __global const float4 *sph_mat,
                        __global const float4 *sph_emi,
                        __global const float4 *sph_texA, __global const float4 *sph_texB,
@@ -702,13 +730,29 @@ __kernel void rt_tiles(__global float4 *out, const int W, const int H,
                        __global const float *tris,
                        __global const float4 *grid_a, __global const uint4 *grid_dims,
                        __global const uint *grid_off, __global const uint *grid_tri,
-                       const float4 bunny_mat, const float4 bunny_emi,
                        __global const int *tile_batch, const int tile) {
     const int lid = (int)get_local_id(0);
     const int tile_id = (int)get_group_id(0);
+    const int W = (int)frame[F_W], H = (int)frame[F_H];
     const int x = tile_batch[tile_id * 2] + lid % tile;
     const int y = tile_batch[tile_id * 2 + 1] + lid / tile;
     if (x >= W || y >= H) return;
+
+    const float4 cam_pos = vload4(0, frame + F_CAM);
+    const float4 fwd = vload4(0, frame + F_FWD);
+    const float4 right = vload4(0, frame + F_RIGHT);
+    const float4 up = vload4(0, frame + F_UP);
+    const float2 aspect_tan = (float2)(frame[F_ASPECT], frame[F_ASPECT + 1]);
+    const int4 counts = (int4)((int)frame[F_COUNTS], (int)frame[F_COUNTS + 1],
+                               (int)frame[F_COUNTS + 2], (int)frame[F_COUNTS + 3]);
+    const int tri_count = (int)frame[F_TRI];
+    const int light_count = (int)frame[F_LIGHTS];
+    const float4 fog = vload4(0, frame + F_FOG);
+    const float4 sun_dir = vload4(0, frame + F_SUN_DIR);
+    const float4 sun_col = vload4(0, frame + F_SUN_COL);
+    const float4 bunny_mat = vload4(0, frame + F_BMAT);
+    const float4 bunny_emi = vload4(0, frame + F_BEMI);
+    const int spp = (int)frame[F_SPP];
 
     float3 result = path_pixel(x, y, W, H, spp,
                                cam_pos, fwd, right, up, aspect_tan, counts,
@@ -863,4 +907,15 @@ __kernel void rt_cas(__global const uchar4 *src, __global uchar4 *dst,
     dst[y * W + x] = (uchar4)(convert_uchar_sat(s.x + 0.5f),
                               convert_uchar_sat(s.y + 0.5f),
                               convert_uchar_sat(s.z + 0.5f), 255);
+}
+
+/* Zero-copy present (cl_khr_gl_sharing): copy the final RGBA8 frame into the
+ * GL-shared texture so the viewer draws it without a readback round-trip. */
+__kernel void rt_present(__global const uchar4 *src, __write_only image2d_t dst,
+                         const int W, const int H) {
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= W || y >= H) return;
+    const uchar4 c = src[y * W + x];
+    write_imageui(dst, (int2)(x, y), (uint4)(c.x, c.y, c.z, 255u));
 }

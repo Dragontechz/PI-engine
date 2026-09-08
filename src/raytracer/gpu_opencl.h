@@ -13,6 +13,15 @@ typedef struct OclRenderer OclRenderer;
 /* May be called before or after InitWindow (no GL interop used). */
 OclRenderer *Ocl_Create(int width, int height);
 
+/* Share raylib's GL texture with the OpenCL device (cl_khr_gl_sharing). On
+ * success Ocl_Render presents the final frame into this texture directly
+ * and skips the CPU readback entirely. Returns 0 when interop is
+ * unavailable (caller keeps using the rgb readback + UpdateTexture). */
+int Ocl_AttachGlTexture(OclRenderer *gpu, unsigned tex_id, int width, int height);
+
+/* Non-zero while a GL texture is attached and used for presentation. */
+int Ocl_GlInterop(const OclRenderer *gpu);
+
 /* Returns 1 on success, 0 on failure (caller falls back).
  * Traces at (internal_w x internal_h) and tone maps on GPU; when
  * internal differs from output, the sRGB film is upscaled to

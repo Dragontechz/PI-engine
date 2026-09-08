@@ -372,6 +372,16 @@ GpuRenderer *GpuRenderer_Create(int width, int height) {
     return g;
 }
 
+int GpuRenderer_AttachGlTexture(GpuRenderer *g, unsigned tex_id, int width, int height) {
+    if (!g || g->backend != 1 || !g->ocl) return 0;
+    return Ocl_AttachGlTexture((OclRenderer *)g->ocl, tex_id, width, height);
+}
+
+int GpuRenderer_GlInterop(GpuRenderer *g) {
+    if (!g || g->backend != 1 || !g->ocl) return 0;
+    return Ocl_GlInterop((OclRenderer *)g->ocl);
+}
+
 int GpuRenderer_Render(GpuRenderer *g, const Scene *s, unsigned char *rgb,
                        int width, int height, int internal_w, int internal_h,
                        int spp, float cas) {

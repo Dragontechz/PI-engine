@@ -19,6 +19,25 @@
 #define OCL_MAX_LIGHTS RT_MAX_LIGHTS
 #define OCL_MAX_TRIS 4096
 #define OCL_GRID_CELLS 1000  /* 10 x 10 x 10 */
+
+/* Per-frame scalar block layout — must mirror F_* in gpu_opencl_kernel.cl. */
+#define F_CAM 0
+#define F_FWD 4
+#define F_RIGHT 8
+#define F_UP 12
+#define F_ASPECT 16
+#define F_W 20
+#define F_H 21
+#define F_SPP 22
+#define F_COUNTS 24
+#define F_TRI 28
+#define F_LIGHTS 29
+#define F_FOG 32
+#define F_SUN_DIR 36
+#define F_SUN_COL 40
+#define F_BMAT 44
+#define F_BEMI 48
+#define FRAME_FLOATS 52
 #define OCL_GRID_TRI_CAP (OCL_MAX_TRIS * 8)  /* max CSR triangle refs */
 #define OCL_LOG_GROUPS 256   /* rt_logavg partial sums */
 #define OCL_LOG_LOCAL 64     /* rt_logavg local size */
@@ -38,6 +57,7 @@ typedef void *clh; /* platform/device/context/queue/program/kernel/mem */
 
 #define CL_SUCCESS 0
 #define CL_TRUE 1
+#define CL_FALSE 0
 #define CL_MEM_READ_ONLY (1 << 2)
 #define CL_MEM_WRITE_ONLY (1 << 1)
 #define CL_MEM_READ_WRITE (1 << 0)
@@ -46,6 +66,9 @@ typedef void *clh; /* platform/device/context/queue/program/kernel/mem */
 #define CL_PLATFORM_NAME 0x0902
 #define CL_DEVICE_NAME 0x102B
 #define CL_PROGRAM_BUILD_LOG 0x1183
+#define CL_GL_CONTEXT_KHR 0x2008
+#define CL_WGL_HDC_KHR 0x200B
+#define CL_GL_TEXTURE_2D 0x0DE1 /* GL_TEXTURE_2D */
 
 typedef cl_int (OCL_CALL *pfn_clGetPlatformIDs)(cl_uint, clh *, cl_uint *);
 typedef cl_int (OCL_CALL *pfn_clGetDeviceIDs)(clh, cl_ulong, cl_uint, clh *, cl_uint *);
@@ -77,6 +100,11 @@ typedef cl_int (OCL_CALL *pfn_clReleaseKernel)(clh);
 typedef cl_int (OCL_CALL *pfn_clReleaseProgram)(clh);
 typedef cl_int (OCL_CALL *pfn_clReleaseCommandQueue)(clh);
 typedef cl_int (OCL_CALL *pfn_clReleaseContext)(clh);
+typedef clh (OCL_CALL *pfn_clCreateFromGLTexture)(clh, cl_ulong, cl_uint, int, cl_uint, cl_int *);
+typedef cl_int (OCL_CALL *pfn_clEnqueueAcquireGLObjects)(clh, cl_uint, const clh *,
+                                                         cl_uint, const void *, void *);
+typedef cl_int (OCL_CALL *pfn_clEnqueueReleaseGLObjects)(clh, cl_uint, const clh *,
+                                                         cl_uint, const void *, void *);
 
 struct OclApi {
     pfn_clGetPlatformIDs GetPlatformIDs;
@@ -101,14 +129,18 @@ struct OclApi {
     pfn_clReleaseProgram ReleaseProgram;
     pfn_clReleaseCommandQueue ReleaseCommandQueue;
     pfn_clReleaseContext ReleaseContext;
+    pfn_clCreateFromGLTexture CreateFromGLTexture;
+    pfn_clEnqueueAcquireGLObjects EnqueueAcquireGLObjects;
+    pfn_clEnqueueReleaseGLObjects EnqueueReleaseGLObjects;
 };
 
 struct OclRenderer {
     struct OclApi api;
     clh device;                 /* cl_device_id for kernel workgroup queries */
     clh ctx, queue, prog, kernel;
-    clh k_logavg, k_post, k_upscale, k_cas, k_tiles;
+    clh k_logavg, k_post, k_upscale, k_cas, k_tiles, k_present;
     clh d_out;
+    clh d_gl;                   /* GL-shared presentation image (interop) */
     clh d_tilebuf;
     clh d_sph, d_sph_mat, d_sph_emi, d_sph_texA, d_sph_texB;
     clh d_box_min, d_box_max, d_box_mat, d_box_emi, d_box_texA, d_box_texB;
@@ -116,7 +148,9 @@ struct OclRenderer {
     clh d_plane_pos, d_plane_mat, d_plane_emi, d_plane_texA, d_plane_texB;
     clh d_lpos, d_lcol, d_lrad, d_tris;
     clh d_grid_a, d_grid_dims, d_grid_off, d_grid_tri;
+    const Scene *uploaded_scene; /* static geometry uploaded for this scene */
     clh d_rgb_in, d_present, d_cas, d_logpart;
+    clh d_frame;
     int tile_size;              /* rt_tiles workgroup tile (8 or 16), 0 = unset */
     float h_grid_a[4];          /* origin.xyz, cell size */
     unsigned h_grid_dims[4];    /* nx, ny, nz, 0 */
@@ -154,6 +188,9 @@ static int resolve_api(struct OclApi *api, HMODULE mod) {
         { "clReleaseProgram", (void **)&api->ReleaseProgram },
         { "clReleaseCommandQueue", (void **)&api->ReleaseCommandQueue },
         { "clReleaseContext", (void **)&api->ReleaseContext },
+        { "clCreateFromGLTexture", (void **)&api->CreateFromGLTexture },
+        { "clEnqueueAcquireGLObjects", (void **)&api->EnqueueAcquireGLObjects },
+        { "clEnqueueReleaseGLObjects", (void **)&api->EnqueueReleaseGLObjects },
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         *table[i].target = (void *)GetProcAddress(mod, table[i].name);
@@ -176,13 +213,13 @@ static void release_all(struct OclRenderer *g) {
                         &g->d_lpos, &g->d_lcol, &g->d_lrad, &g->d_tris,
                         &g->d_grid_a, &g->d_grid_dims, &g->d_grid_off, &g->d_grid_tri,
                         &g->d_rgb_in, &g->d_present, &g->d_cas, &g->d_logpart,
-                        &g->d_tilebuf };
+                        &g->d_tilebuf, &g->d_gl };
         for (size_t i = 0; i < sizeof mems / sizeof mems[0]; i++) {
             if (*mems[i]) g->api.ReleaseMemObject(*mems[i]);
         }
     }
     clh *kerns[] = { &g->kernel, &g->k_logavg, &g->k_post, &g->k_upscale, &g->k_cas,
-                     &g->k_tiles };
+                     &g->k_tiles, &g->k_present };
     for (size_t i = 0; i < sizeof kerns / sizeof kerns[0]; i++) {
         if (*kerns[i] && g->api.ReleaseKernel) g->api.ReleaseKernel(*kerns[i]);
     }
@@ -258,7 +295,29 @@ OclRenderer *Ocl_Create(int width, int height) {
 
     cl_int err = 0;
     g->device = dev;
-    g->ctx = g->api.CreateContext(NULL, 1, &dev, NULL, NULL, &err);
+    /* Share with raylib's GL context when one is current on this thread: the
+     * final frame can then be presented with zero copies (cl_khr_gl_sharing). */
+    intptr_t ctx_props[5] = { 0, 0, 0, 0, 0 };
+    typedef void *WINAPI pfn_wgl_ctx(void);
+    typedef void *WINAPI pfn_wgl_dc(void);
+    static pfn_wgl_ctx *wgl_ctx_fn = NULL;
+    static pfn_wgl_dc *wgl_dc_fn = NULL;
+    if (!wgl_ctx_fn) {
+        HMODULE ogl = GetModuleHandleA("opengl32.dll");
+        if (ogl) {
+            wgl_ctx_fn = (pfn_wgl_ctx *)GetProcAddress(ogl, "wglGetCurrentContext");
+            wgl_dc_fn = (pfn_wgl_dc *)GetProcAddress(ogl, "wglGetCurrentDC");
+        }
+    }
+    HGLRC gl_ctx = wgl_ctx_fn ? (HGLRC)wgl_ctx_fn() : NULL;
+    HDC gl_dc = wgl_dc_fn ? (HDC)wgl_dc_fn() : NULL;
+    if (gl_ctx && gl_dc) {
+        ctx_props[0] = CL_GL_CONTEXT_KHR;
+        ctx_props[1] = (intptr_t)gl_ctx;
+        ctx_props[2] = CL_WGL_HDC_KHR;
+        ctx_props[3] = (intptr_t)gl_dc;
+    }
+    g->ctx = g->api.CreateContext(ctx_props, 1, &dev, NULL, NULL, &err);
     OCL_LOG("context created");
     if (err != CL_SUCCESS || !g->ctx) { release_all(g); free(g); return NULL; }
     g->queue = g->api.CreateCommandQueue(g->ctx, dev, 0, &err);
@@ -329,6 +388,7 @@ OclRenderer *Ocl_Create(int width, int height) {
     g->d_present = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 4);
     g->d_cas = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 4);
     g->d_logpart = make_buffer(g, CL_MEM_READ_WRITE, OCL_LOG_GROUPS * 4);
+    g->d_frame = make_buffer(g, CL_MEM_READ_ONLY, FRAME_FLOATS * 4);
     g->d_tilebuf = make_buffer(g, CL_MEM_READ_ONLY, (size_t)OCL_MAX_TILES * 2 * sizeof(cl_int));
     if (!g->d_out || !g->d_sph || !g->d_sph_mat || !g->d_sph_emi || !g->d_sph_texA
         || !g->d_sph_texB || !g->d_box_min || !g->d_box_max || !g->d_box_mat
@@ -338,9 +398,54 @@ OclRenderer *Ocl_Create(int width, int height) {
         || !g->d_plane_texA || !g->d_plane_texB || !g->d_lpos || !g->d_lcol
         || !g->d_lrad || !g->d_grid_a || !g->d_grid_dims || !g->d_grid_off
         || !g->d_grid_tri || !g->d_rgb_in || !g->d_present || !g->d_cas
-        || !g->d_logpart || !g->d_tilebuf) {
+        || !g->d_logpart || !g->d_tilebuf || !g->d_frame) {
         fprintf(stderr, "OpenCL: buffer allocation failed\n");
         release_all(g); free(g); return NULL;
+    }
+
+    /* Bind every trace-kernel argument ONCE: SetKernelArg costs ~3 ms per
+     * call on 51-arg kernels with the Gen9 driver, so the frame loop must
+     * never call it. Per-frame scalars flow through d_frame (async write);
+     * geometry buffers hold stable handles even before their contents are
+     * uploaded by ocl_upload_scene. */
+    {
+        struct OclApi *api = &g->api;
+        clh *bufs[] = {
+            &g->d_sph, &g->d_sph_mat, &g->d_sph_emi, &g->d_sph_texA, &g->d_sph_texB,
+            &g->d_box_min, &g->d_box_max, &g->d_box_mat, &g->d_box_emi,
+            &g->d_box_texA, &g->d_box_texB,
+            &g->d_cyl_b, &g->d_cyl_h, &g->d_cyl_mat, &g->d_cyl_emi,
+            &g->d_cyl_texA, &g->d_cyl_texB,
+            &g->d_plane_pos, &g->d_plane_mat, &g->d_plane_emi,
+            &g->d_plane_texA, &g->d_plane_texB,
+            &g->d_lpos, &g->d_lcol, &g->d_lrad,
+        };
+        struct { clh kernel; int has_tiles; } ks[] = {
+            { g->kernel, 0 }, { g->k_tiles, 1 },
+        };
+        for (size_t k = 0; k < sizeof ks / sizeof ks[0]; k++) {
+            cl_uint arg = 0;
+            int ok = 1;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_out) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_frame) == CL_SUCCESS;
+            for (size_t i = 0; i < sizeof bufs / sizeof bufs[0]; i++)
+                ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), bufs[i]) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_tris) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_grid_a) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_grid_dims) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_grid_off) == CL_SUCCESS;
+            ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &g->d_grid_tri) == CL_SUCCESS;
+            if (ks[k].has_tiles) {
+                clh d_tilebuf = g->d_tilebuf;
+                cl_int tile_arg = 16; /* RT_HYBRID_TILE */
+                ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(clh), &d_tilebuf) == CL_SUCCESS;
+                ok &= api->SetKernelArg(ks[k].kernel, arg++, sizeof(cl_int), &tile_arg) == CL_SUCCESS;
+            }
+            if (!ok) {
+                fprintf(stderr, "OpenCL: kernel arg binding failed\n");
+                release_all(g); free(g); return NULL;
+            }
+        }
     }
     fprintf(stderr, "OpenCL: renderer ready\n");
     return g;
@@ -382,6 +487,13 @@ static int upload_triangles(OclRenderer *g, const Scene *s) {
     g->d_tris = g->api.CreateBuffer(g->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                     (size_t)total * 9 * sizeof(float), data, &err);
     if (err != CL_SUCCESS || !g->d_tris) { free(data); g->tri_count = 0; return 0; }
+    /* d_tris was created after Ocl_Create bound the kernel args: rebind the
+     * handle into both kernels once (a one-time SetKernelArg cost). */
+    {
+        clh tris = g->d_tris;
+        g->api.SetKernelArg(g->kernel, 27, sizeof(clh), &tris);
+        g->api.SetKernelArg(g->k_tiles, 27, sizeof(clh), &tris);
+    }
 
     /* ---- build a uniform grid over the triangles (10x10x10 CSR) ---- */
     /* absolute vertex = v0 (+ e1) (+ e2); rows hold v0, e1, e2 */
@@ -509,6 +621,7 @@ struct OclSceneInfo { int ns, nb, nc, npl, nl; int nargs; };
 static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
                             int film_w, int film_h, float aspect, int spp,
                             struct OclSceneInfo *info) {
+    (void)kernel; /* args bound once in Ocl_Create */
     if (!upload_triangles(g, s)) { g->broken = 1; return 0; }
 
     struct OclApi *api = &g->api;
@@ -658,97 +771,126 @@ static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
         bemi[3] = s->objects[i].material.shininess;
     }
 
-    struct { clh *mem; const void *data; size_t size; } uploads[] = {
-        { &g->d_sph, sph, OCL_MAX_SPHERES * 16 },
-        { &g->d_sph_mat, sph_mat, OCL_MAX_SPHERES * 16 },
-        { &g->d_sph_emi, sph_emi, OCL_MAX_SPHERES * 16 },
-        { &g->d_sph_texA, sph_texA, OCL_MAX_SPHERES * 16 },
-        { &g->d_sph_texB, sph_texB, OCL_MAX_SPHERES * 16 },
-        { &g->d_box_min, box_min, OCL_MAX_BOXES * 16 },
-        { &g->d_box_max, box_max, OCL_MAX_BOXES * 16 },
-        { &g->d_box_mat, box_mat, OCL_MAX_BOXES * 16 },
-        { &g->d_box_emi, box_emi, OCL_MAX_BOXES * 16 },
-        { &g->d_box_texA, box_texA, OCL_MAX_BOXES * 16 },
-        { &g->d_box_texB, box_texB, OCL_MAX_BOXES * 16 },
-        { &g->d_cyl_b, cyl_b, OCL_MAX_CYLS * 16 },
-        { &g->d_cyl_h, cyl_h, OCL_MAX_CYLS * 16 },
-        { &g->d_cyl_mat, cyl_mat, OCL_MAX_CYLS * 16 },
-        { &g->d_cyl_emi, cyl_emi, OCL_MAX_CYLS * 16 },
-        { &g->d_cyl_texA, cyl_texA, OCL_MAX_CYLS * 16 },
-        { &g->d_cyl_texB, cyl_texB, OCL_MAX_CYLS * 16 },
-        { &g->d_plane_pos, plane_pos, OCL_MAX_PLANES * 16 },
-        { &g->d_plane_mat, plane_mat, OCL_MAX_PLANES * 16 },
-        { &g->d_plane_emi, plane_emi, OCL_MAX_PLANES * 16 },
-        { &g->d_plane_texA, plane_texA, OCL_MAX_PLANES * 16 },
-        { &g->d_plane_texB, plane_texB, OCL_MAX_PLANES * 16 },
-        { &g->d_lpos, lpos, OCL_MAX_LIGHTS * 16 },
-        { &g->d_lcol, lcol, OCL_MAX_LIGHTS * 16 },
-        { &g->d_lrad, lrad, OCL_MAX_LIGHTS * 16 },
+    /* Static geometry/materials upload once per scene; only sphere centers and
+     * lights move frame-to-frame (pushable balls). All writes are async: the
+     * in-order queue runs them before any kernel enqueued afterwards, and
+     * blocking CL_TRUE writes cost ~15 ms each on the Gen9 driver. */
+    if (g->uploaded_scene != s) {
+        struct { clh *mem; const void *data; size_t size; } uploads[] = {
+            { &g->d_sph_mat, sph_mat, (size_t)ns * 16 },
+            { &g->d_sph_emi, sph_emi, (size_t)ns * 16 },
+            { &g->d_sph_texA, sph_texA, (size_t)ns * 16 },
+            { &g->d_sph_texB, sph_texB, (size_t)ns * 16 },
+            { &g->d_box_min, box_min, (size_t)nb * 16 },
+            { &g->d_box_max, box_max, (size_t)nb * 16 },
+            { &g->d_box_mat, box_mat, (size_t)nb * 16 },
+            { &g->d_box_emi, box_emi, (size_t)nb * 16 },
+            { &g->d_box_texA, box_texA, (size_t)nb * 16 },
+            { &g->d_box_texB, box_texB, (size_t)nb * 16 },
+            { &g->d_cyl_b, cyl_b, (size_t)nc * 16 },
+            { &g->d_cyl_h, cyl_h, (size_t)nc * 16 },
+            { &g->d_cyl_mat, cyl_mat, (size_t)nc * 16 },
+            { &g->d_cyl_emi, cyl_emi, (size_t)nc * 16 },
+            { &g->d_cyl_texA, cyl_texA, (size_t)nc * 16 },
+            { &g->d_cyl_texB, cyl_texB, (size_t)nc * 16 },
+            { &g->d_plane_pos, plane_pos, (size_t)npl * 16 },
+            { &g->d_plane_mat, plane_mat, (size_t)npl * 16 },
+            { &g->d_plane_emi, plane_emi, (size_t)npl * 16 },
+            { &g->d_plane_texA, plane_texA, (size_t)npl * 16 },
+            { &g->d_plane_texB, plane_texB, (size_t)npl * 16 },
+        };
+        for (size_t i = 0; i < sizeof uploads / sizeof uploads[0]; i++) {
+            if (uploads[i].size == 0) continue;
+            if (api->EnqueueWriteBuffer(g->queue, *uploads[i].mem, CL_FALSE, 0, uploads[i].size,
+                                        uploads[i].data, 0, NULL, NULL) != CL_SUCCESS) {
+                g->broken = 1;
+                return 0;
+            }
+        }
+        g->uploaded_scene = s;
+    }
+    struct { clh *mem; const void *data; size_t size; } dynamic[] = {
+        { &g->d_sph, sph, (size_t)ns * 16 },
+        { &g->d_lpos, lpos, (size_t)nl * 16 },
+        { &g->d_lcol, lcol, (size_t)nl * 16 },
+        { &g->d_lrad, lrad, (size_t)nl * 16 },
     };
-    for (size_t i = 0; i < sizeof uploads / sizeof uploads[0]; i++) {
-        if (api->EnqueueWriteBuffer(g->queue, *uploads[i].mem, CL_TRUE, 0, uploads[i].size,
-                                    uploads[i].data, 0, NULL, NULL) != CL_SUCCESS) {
+    for (size_t i = 0; i < sizeof dynamic / sizeof dynamic[0]; i++) {
+        if (dynamic[i].size == 0) continue;
+        if (api->EnqueueWriteBuffer(g->queue, *dynamic[i].mem, CL_FALSE, 0, dynamic[i].size,
+                                    dynamic[i].data, 0, NULL, NULL) != CL_SUCCESS) {
             g->broken = 1;
             return 0;
         }
     }
 
-    clh d_out = g->d_out, d_tris = g->d_tris;
-    cl_uint arg = 0;
-    int ok = 1;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &d_out) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(int), &film_w) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(int), &film_h) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(int), &spp) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, cam_pos) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, f4) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, r4) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, u4) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 8, aspect_tan) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, counts) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(int), &g->tri_count) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(int), &nl) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, fog) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, sun_dir) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, sun_col) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_sph) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_sph_mat) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_sph_emi) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_sph_texA) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_sph_texB) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_min) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_max) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_mat) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_emi) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_texA) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_box_texB) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_b) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_h) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_mat) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_emi) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_texA) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_cyl_texB) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_plane_pos) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_plane_mat) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_plane_emi) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_plane_texA) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_plane_texB) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_lpos) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_lcol) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_lrad) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &d_tris) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_grid_a) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_grid_dims) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_grid_off) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, sizeof(clh), &g->d_grid_tri) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, bmat) == CL_SUCCESS;
-    ok &= api->SetKernelArg(kernel, arg++, 16, bemi) == CL_SUCCESS;
-    if (!ok) { g->broken = 1; return 0; }
+    /* Per-frame scalars go through one buffer write; kernel args were bound
+     * once in Ocl_Create (SetKernelArg is pathologically slow on Gen9). */
+    float frame[FRAME_FLOATS];
+    for (int i = 0; i < 4; i++) {
+        frame[F_CAM + i] = cam_pos[i];
+        frame[F_FWD + i] = f4[i];
+        frame[F_RIGHT + i] = r4[i];
+        frame[F_UP + i] = u4[i];
+        frame[F_FOG + i] = fog[i];
+        frame[F_SUN_DIR + i] = sun_dir[i];
+        frame[F_SUN_COL + i] = sun_col[i];
+        frame[F_BMAT + i] = bmat[i];
+        frame[F_BEMI + i] = bemi[i];
+    }
+    frame[F_ASPECT] = aspect_tan[0];
+    frame[F_ASPECT + 1] = aspect_tan[1];
+    frame[F_W] = (float)film_w;
+    frame[F_H] = (float)film_h;
+    frame[F_SPP] = (float)spp;
+    frame[F_COUNTS] = (float)ns;
+    frame[F_COUNTS + 1] = (float)nb;
+    frame[F_COUNTS + 2] = (float)nc;
+    frame[F_COUNTS + 3] = (float)npl;
+    frame[F_TRI] = (float)g->tri_count;
+    frame[F_LIGHTS] = (float)nl;
+    /* Blocking on purpose: the Gen9 driver silently drops this write when it
+     * is enqueued non-blocking and followed directly by a kernel launch. The
+     * Finish also flushes the dynamic geometry writes above. */
+    if (api->EnqueueWriteBuffer(g->queue, g->d_frame, CL_TRUE, 0,
+                                sizeof frame, frame, 0, NULL, NULL) != CL_SUCCESS) {
+        g->broken = 1;
+        return 0;
+    }
 
     if (info) {
         info->ns = ns; info->nb = nb; info->nc = nc;
-        info->npl = npl; info->nl = nl; info->nargs = (int)arg;
+        info->npl = npl; info->nl = nl; info->nargs = 0;
     }
+    return 1;
+}
+
+int Ocl_GlInterop(const OclRenderer *g) {
+    return g && g->d_gl != NULL;
+}
+
+int Ocl_AttachGlTexture(OclRenderer *g, unsigned tex_id, int width, int height) {
+    if (!g || g->broken || !tex_id || width <= 0 || height <= 0) return 0;
+    if (!g->api.CreateFromGLTexture || !g->api.EnqueueAcquireGLObjects ||
+        !g->api.EnqueueReleaseGLObjects)
+        return 0;
+    if (width > OCL_MAX_W || height > OCL_MAX_H) return 0;
+    cl_int err = 0;
+    g->d_gl = g->api.CreateFromGLTexture(g->ctx, CL_MEM_WRITE_ONLY, CL_GL_TEXTURE_2D,
+                                         0, tex_id, &err);
+    if (err != CL_SUCCESS || !g->d_gl) {
+        fprintf(stderr, "OpenCL: GL texture attach failed (%d), using readback\n", err);
+        g->d_gl = NULL;
+        return 0;
+    }
+    g->k_present = g->api.CreateKernel(g->prog, "rt_present", &err);
+    if (err != CL_SUCCESS || !g->k_present) {
+        fprintf(stderr, "OpenCL: rt_present creation failed (%d), using readback\n", err);
+        g->api.ReleaseMemObject(g->d_gl);
+        g->d_gl = NULL;
+        return 0;
+    }
+    fprintf(stderr, "OpenCL: GL interop present active (%dx%d)\n", width, height);
     return 1;
 }
 
@@ -854,9 +996,30 @@ int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
         }
         if (!post_ok) { g->broken = 1; return 0; }
     }
+    if (g->d_gl) {
+        /* Zero-copy present: copy the final frame into the GL-shared texture
+         * while it is acquired; the viewer draws it directly. */
+        int gl_ok = 1;
+        clh k_pr = g->k_present, d_gl = g->d_gl;
+        gl_ok &= api->SetKernelArg(k_pr, 0, sizeof(clh), &read_buf) == CL_SUCCESS;
+        gl_ok &= api->SetKernelArg(k_pr, 1, sizeof(clh), &d_gl) == CL_SUCCESS;
+        gl_ok &= api->SetKernelArg(k_pr, 2, sizeof(int), &width) == CL_SUCCESS;
+        gl_ok &= api->SetKernelArg(k_pr, 3, sizeof(int), &height) == CL_SUCCESS;
+        gl_ok &= api->EnqueueAcquireGLObjects(g->queue, 1, &d_gl, 0, NULL, NULL) == CL_SUCCESS;
+        const size_t pglobal[2] = { ((size_t)width + local[0] - 1) / local[0] * local[0],
+                                    ((size_t)height + local[1] - 1) / local[1] * local[1] };
+        gl_ok &= api->EnqueueNDRangeKernel(g->queue, k_pr, 2, NULL, pglobal, local,
+                                           0, NULL, NULL) == CL_SUCCESS;
+        gl_ok &= api->EnqueueReleaseGLObjects(g->queue, 1, &d_gl, 0, NULL, NULL) == CL_SUCCESS;
+        if (!gl_ok) { g->broken = 1; return 0; }
+    }
     if (api->Finish(g->queue) != CL_SUCCESS) { g->broken = 1; return 0; }
     QueryPerformanceCounter(&t2);
 
+    if (g->d_gl) {
+        /* readback skipped: the frame lives in the GL texture now */
+        QueryPerformanceCounter(&t3);
+    } else {
     /* readback: 8-bit sRGB rgba at presentation size, repack to rgb888 */
     const size_t outpix = (size_t)width * height;
     static unsigned char *rgba = NULL;
@@ -878,15 +1041,24 @@ int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
         rgb[i * 3 + 2] = rgba[i * 4 + 2];
     }
     QueryPerformanceCounter(&t3);
+    }
 
     static int dump_once = 0;
     if (!dump_once) {
         dump_once = 1;
+        unsigned char px[3] = { 0, 0, 0 };
+        if (g->d_gl) {
+            unsigned char px4[4] = { 0, 0, 0, 0 };
+            api->EnqueueReadBuffer(g->queue, read_buf, CL_TRUE, 0, 4, px4, 0, NULL, NULL);
+            px[0] = px4[0]; px[1] = px4[1]; px[2] = px4[2];
+        } else {
+            px[0] = rgb[0]; px[1] = rgb[1]; px[2] = rgb[2];
+        }
         fprintf(stderr, "OpenCL: first px %d %d %d | ns=%d nb=%d nc=%d npl=%d nl=%d tri=%d spp=%d\n",
-                rgb[0], rgb[1], rgb[2], info.ns, info.nb, info.nc, info.npl,
+                px[0], px[1], px[2], info.ns, info.nb, info.nc, info.npl,
                 info.nl, g->tri_count, spp);
     }
-    if (++g->frames % 30 == 0) {
+    if (++g->frames % 30 == 0 && getenv("RT_PROFILE")) {
         double kms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / qpc_freq.QuadPart;
         double pms = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / qpc_freq.QuadPart;
         double rms = (double)(t3.QuadPart - t2.QuadPart) * 1000.0 / qpc_freq.QuadPart;
@@ -908,29 +1080,16 @@ int Ocl_TraceTiles(OclRenderer *g, const Scene *s, int width, int height,
     if (tile_count > OCL_MAX_TILES) return 0;
     if (width <= 0 || width > OCL_MAX_W || height <= 0 || height > OCL_MAX_H) return 0;
     if (spp < 1) spp = 1;
-    if (tile != 8 && tile != 16) return 0; /* workgroup = tile*tile <= 256 */
+    if (tile != 16) return 0; /* tile arg is bound once at Ocl_Create */
     g->tile_size = tile;
 
     struct OclSceneInfo info;
     /* film aspect: matches the CPU ray generator pixel for pixel */
     if (!ocl_upload_scene(g, s, g->k_tiles, width, height,
                           (float)width / (float)height, spp, &info)) return 0;
-
-    /* extra rt_tiles args: tile batch + tile size */
     struct OclApi *api = &g->api;
-    clh d_tilebuf = g->d_tilebuf;
-    cl_int tile_arg = (cl_int)tile;
-    cl_uint arg = (cl_uint)info.nargs;
-    cl_int e1 = api->SetKernelArg(g->k_tiles, arg++, sizeof(clh), &d_tilebuf);
-    cl_int e2 = api->SetKernelArg(g->k_tiles, arg++, sizeof(cl_int), &tile_arg);
-    if (e1 != CL_SUCCESS || e2 != CL_SUCCESS) {
-        fprintf(stderr, "OpenCL: rt_tiles SetKernelArg failed (%d,%d) nargs=%d\n",
-                e1, e2, info.nargs);
-        g->broken = 1;
-        return 0;
-    }
 
-    if (api->EnqueueWriteBuffer(g->queue, g->d_tilebuf, CL_TRUE, 0,
+    if (api->EnqueueWriteBuffer(g->queue, g->d_tilebuf, CL_FALSE, 0,
                                 (size_t)tile_count * 2 * sizeof(cl_int),
                                 tiles_xy, 0, NULL, NULL) != CL_SUCCESS) {
         fprintf(stderr, "OpenCL: rt_tiles tile-list upload failed\n");
@@ -941,12 +1100,11 @@ int Ocl_TraceTiles(OclRenderer *g, const Scene *s, int width, int height,
      * so probe locally: halve until the enqueue is accepted. */
     const size_t local = (size_t)tile * (size_t)tile;
     cl_int e3 = -999;
-    size_t used_local = 0;
     for (size_t try_local = local; try_local >= 1; try_local /= 2) {
         const size_t try_global = try_local * (size_t)tile_count;
         e3 = api->EnqueueNDRangeKernel(g->queue, g->k_tiles, 1, NULL,
                                        &try_global, &try_local, 0, NULL, NULL);
-        if (e3 == CL_SUCCESS) { used_local = try_local; break; }
+        if (e3 == CL_SUCCESS) break;
         fprintf(stderr, "OpenCL: rt_tiles enqueue local=%zu -> %d\n", try_local, e3);
     }
     if (e3 != CL_SUCCESS) {
