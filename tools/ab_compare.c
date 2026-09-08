@@ -4,6 +4,7 @@
  * Writes ab_cpu.bmp and ab_gpu.bmp for visual diffs. */
 #include "tracer.h"
 #include "gpu_opencl.h"
+#include "hybrid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,11 +56,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ab: entered\n");
     int spp = 8;
     int W = 640, H = 360;
+    int hybrid = 0;
+int frames = 1;
     const char *which = "small";
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) spp = atoi(argv[++i]);
         else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) W = atoi(argv[++i]);
         else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) H = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--hybrid") == 0) hybrid = 1;
+    else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "small") == 0 || strcmp(argv[i], "world") == 0) which = argv[i];
     }
     if (spp < 1) spp = 1;
@@ -81,13 +86,29 @@ int main(int argc, char **argv) {
     }
     double t1 = now_ms();
 
-    OclRenderer *g = Ocl_Create(W, H);
-    if (!g) { fprintf(stderr, "OpenCL unavailable\n"); return 2; }
-    if (!Ocl_Render(g, &scene, b, W, H, W, H, spp, 0.0f)) {
-        fprintf(stderr, "GPU render failed\n"); return 1;
+    if (hybrid) {
+        /* Phase 2 gate: cooperative CPU + GPU tile render vs CPU reference. */
+        if (!rt_hybrid_prepare(W, H)) { fprintf(stderr, "hybrid: no device\n"); return 2; }
+        V3 *film = (V3 *)malloc((size_t)W * H * sizeof *film);
+        if (!film) { fprintf(stderr, "OOM\n"); return 1; }
+        double frame_ms = 0.0;
+        for (int f = 0; f < frames; f++) {
+            if (!rt_render_hybrid_hdr(&scene, film, W, H, spp, 4, &frame_ms) ||
+                !rt_postprocess_hdr(film, b, W, H)) {
+                fprintf(stderr, "hybrid render failed\n"); return 1;
+            }
+            fprintf(stderr, "hybrid frame %d: %.0f ms\n", f + 1, frame_ms);
+        }
+        free(film);
+    } else {
+        OclRenderer *g = Ocl_Create(W, H);
+        if (!g) { fprintf(stderr, "OpenCL unavailable\n"); return 2; }
+        if (!Ocl_Render(g, &scene, b, W, H, W, H, spp, 0.0f)) {
+            fprintf(stderr, "GPU render failed\n"); return 1;
+        }
+        Ocl_Destroy(g);
     }
     double t2 = now_ms();
-    Ocl_Destroy(g);
 
     /* deltas at or above 6/255 are visually obvious; count them separately */
     double mae = 0.0;

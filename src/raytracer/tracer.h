@@ -135,6 +135,14 @@ int rt_render_exact_fast(const Scene *scene, unsigned char *rgb, int width, int 
                          int shadow_samples, int max_depth);
 int rt_render_native(const Scene *scene, unsigned char *rgb, int width, int height,
                      int spp, int max_depth);
+/* Trace only the listed tile origins (tx, ty pairs, tile size 16) into an
+ * HDR film of width x height pixels; worker threads pop tiles dynamically. */
+int rt_render_tiles_hdr(const Scene *scene, V3 *hdr, int width, int height,
+                        int spp, int max_depth, const int *tiles_xy, int tile_count);
+/* Morton-ordered tile-origin list ((tx, ty) pairs, tile px each) covering
+ * the film; out_xy == NULL returns the tile count, else the count written
+ * (or -1 if cap is too small). Shared by the CPU and hybrid schedulers. */
+int rt_build_tile_origins(int width, int height, int tile, int *out_xy, int cap);
 int rt_render_adaptive(const Scene *scene, unsigned char *rgb, int width, int height,
                        int spp_min, int spp_max, float epsilon, float contrast,
                        int max_depth);

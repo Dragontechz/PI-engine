@@ -21,6 +21,15 @@ int Ocl_Render(OclRenderer *gpu, const Scene *scene, unsigned char *rgb,
                int width, int height, int internal_w, int internal_h,
                int spp, float cas);
 
+/* Hybrid tile workers: enqueue a kernel covering the listed tile origins
+ * ((tx, ty) pairs, tile x tile work-items each; tile is 8 or 16) without
+ * blocking, then later finish + read back only those tiles into hdr
+ * (width x height V3 pixels). *kernel_ms receives GPU time in ms. */
+int Ocl_TraceTiles(OclRenderer *gpu, const Scene *scene, int width, int height,
+                   int spp, const int *tiles_xy, int tile_count, int tile);
+int Ocl_ReadTiles(OclRenderer *gpu, V3 *hdr, int width, int height,
+                  const int *tiles_xy, int tile_count, double *kernel_ms);
+
 void Ocl_Destroy(OclRenderer *gpu);
 
 #endif

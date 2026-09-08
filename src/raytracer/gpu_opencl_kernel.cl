@@ -518,40 +518,43 @@ void fetch_material(const int kind, const int idx,
 }
 
 /* path_radiance port: iterative MIS path tracer, max_depth 4, Russian
- * roulette from depth 2, fog support (scene_small has fog_density 0). */
-__kernel void rt_main(__global float4 *out, const int W, const int H,
-                      const int spp,
-                      const float4 cam_pos, const float4 fwd, const float4 right,
-                      const float4 up, const float2 aspect_tan, const int4 counts,
-                      const int tri_count, const int light_count,
-                      const float4 fog, const float4 sun_dir, const float4 sun_col,
-                      __global const float4 *sph, __global const float4 *sph_mat,
-                      __global const float4 *sph_emi,
-                      __global const float4 *sph_texA, __global const float4 *sph_texB,
-                      __global const float4 *box_min, __global const float4 *box_max,
-                      __global const float4 *box_mat, __global const float4 *box_emi,
-                      __global const float4 *box_texA, __global const float4 *box_texB,
-                      __global const float4 *cyl_b, __global const float4 *cyl_h,
-                      __global const float4 *cyl_mat, __global const float4 *cyl_emi,
-                      __global const float4 *cyl_texA, __global const float4 *cyl_texB,
-                      __global const float4 *plane_pos, __global const float4 *plane_mat,
-                      __global const float4 *plane_emi,
-                      __global const float4 *plane_texA, __global const float4 *plane_texB,
-                      __global const float4 *lpos, __global const float4 *lcol,
-                      __global const float4 *lrad,
-                      __global const float *tris,
-                      __global const float4 *grid_a, __global const uint4 *grid_dims,
-                      __global const uint *grid_off, __global const uint *grid_tri,
-                      const float4 bunny_mat, const float4 bunny_emi) {
-    const int x = (int)get_global_id(0);
-    const int y = (int)get_global_id(1);
-    if (x >= W || y >= H) return;
-
+ * roulette from depth 2, fog support (scene_small has fog_density 0).
+ * Shared per-pixel body for rt_main (full frame) and rt_tiles (hybrid
+ * batches). per_sample_seed != 0 re-seeds per sample exactly like the CPU
+ * tracer (pixel_seed + sample*0x9e3779b9) so a pixel's RNG stream never
+ * depends on which device rendered it; rt_main keeps the legacy seed-once
+ * stream. */
+float3 path_pixel(const int x, const int y, const int W, const int H,
+                  const int spp,
+                  const float4 cam_pos, const float4 fwd, const float4 right,
+                  const float4 up, const float2 aspect_tan, const int4 counts,
+                  const int tri_count, const int light_count,
+                  const float4 fog, const float4 sun_dir, const float4 sun_col,
+                  __global const float4 *sph, __global const float4 *sph_mat,
+                  __global const float4 *sph_emi,
+                  __global const float4 *sph_texA, __global const float4 *sph_texB,
+                  __global const float4 *box_min, __global const float4 *box_max,
+                  __global const float4 *box_mat, __global const float4 *box_emi,
+                  __global const float4 *box_texA, __global const float4 *box_texB,
+                  __global const float4 *cyl_b, __global const float4 *cyl_h,
+                  __global const float4 *cyl_mat, __global const float4 *cyl_emi,
+                  __global const float4 *cyl_texA, __global const float4 *cyl_texB,
+                  __global const float4 *plane_pos, __global const float4 *plane_mat,
+                  __global const float4 *plane_emi,
+                  __global const float4 *plane_texA, __global const float4 *plane_texB,
+                  __global const float4 *lpos, __global const float4 *lcol,
+                  __global const float4 *lrad,
+                  __global const float *tris,
+                  __global const float4 *grid_a, __global const uint4 *grid_dims,
+                  __global const uint *grid_off, __global const uint *grid_tri,
+                  const float4 bunny_mat, const float4 bunny_emi,
+                  const int per_sample_seed) {
     uint rng = pixel_seed(x, y);
     float3 result = (float3)(0.0f);
     int sample_count = spp < 1 ? 1 : spp;
 
     for (int sample = 0; sample < sample_count; sample++) {
+        if (per_sample_seed != 0) rng = pixel_seed(x, y) + (uint)sample * 0x9e3779b9u;
         float jx = rng_float(&rng);
         float jy = rng_float(&rng);
         float u = ((float)x + jx) / (float)W * 2.0f - 1.0f;
@@ -625,10 +628,99 @@ __kernel void rt_main(__global float4 *out, const int W, const int H,
             rd = next_dir;
         }
     }
-    result /= (float)sample_count;
+    return result / (float)sample_count;
+}
+
+__kernel void rt_main(__global float4 *out, const int W, const int H,
+                      const int spp,
+                      const float4 cam_pos, const float4 fwd, const float4 right,
+                      const float4 up, const float2 aspect_tan, const int4 counts,
+                      const int tri_count, const int light_count,
+                      const float4 fog, const float4 sun_dir, const float4 sun_col,
+                      __global const float4 *sph, __global const float4 *sph_mat,
+                      __global const float4 *sph_emi,
+                      __global const float4 *sph_texA, __global const float4 *sph_texB,
+                      __global const float4 *box_min, __global const float4 *box_max,
+                      __global const float4 *box_mat, __global const float4 *box_emi,
+                      __global const float4 *box_texA, __global const float4 *box_texB,
+                      __global const float4 *cyl_b, __global const float4 *cyl_h,
+                      __global const float4 *cyl_mat, __global const float4 *cyl_emi,
+                      __global const float4 *cyl_texA, __global const float4 *cyl_texB,
+                      __global const float4 *plane_pos, __global const float4 *plane_mat,
+                      __global const float4 *plane_emi,
+                      __global const float4 *plane_texA, __global const float4 *plane_texB,
+                      __global const float4 *lpos, __global const float4 *lcol,
+                      __global const float4 *lrad,
+                      __global const float *tris,
+                      __global const float4 *grid_a, __global const uint4 *grid_dims,
+                      __global const uint *grid_off, __global const uint *grid_tri,
+                      const float4 bunny_mat, const float4 bunny_emi) {
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= W || y >= H) return;
+
+    float3 result = path_pixel(x, y, W, H, spp,
+                               cam_pos, fwd, right, up, aspect_tan, counts,
+                               tri_count, light_count, fog, sun_dir, sun_col,
+                               sph, sph_mat, sph_emi, sph_texA, sph_texB,
+                               box_min, box_max, box_mat, box_emi, box_texA, box_texB,
+                               cyl_b, cyl_h, cyl_mat, cyl_emi, cyl_texA, cyl_texB,
+                               plane_pos, plane_mat, plane_emi, plane_texA, plane_texB,
+                               lpos, lcol, lrad, tris,
+                               grid_a, grid_dims, grid_off, grid_tri,
+                               bunny_mat, bunny_emi, 0);
 
     const int o = y * W + x;
     out[o] = (float4)(result, 1.0f);
+}
+
+/* Hybrid tile worker: one workgroup per tile (tile*tile work-items),
+ * tile_batch holds (x0, y0) pairs in Morton order. Writes float4 HDR for
+ * its pixels into the same film layout as rt_main; the host composites
+ * CPU and GPU tiles and runs the shared post chain. Uses the CPU RNG
+ * scheme (per_sample_seed = 1). */
+__kernel void rt_tiles(__global float4 *out, const int W, const int H,
+                       const int spp,
+                       const float4 cam_pos, const float4 fwd, const float4 right,
+                       const float4 up, const float2 aspect_tan, const int4 counts,
+                       const int tri_count, const int light_count,
+                       const float4 fog, const float4 sun_dir, const float4 sun_col,
+                       __global const float4 *sph, __global const float4 *sph_mat,
+                       __global const float4 *sph_emi,
+                       __global const float4 *sph_texA, __global const float4 *sph_texB,
+                       __global const float4 *box_min, __global const float4 *box_max,
+                       __global const float4 *box_mat, __global const float4 *box_emi,
+                       __global const float4 *box_texA, __global const float4 *box_texB,
+                       __global const float4 *cyl_b, __global const float4 *cyl_h,
+                       __global const float4 *cyl_mat, __global const float4 *cyl_emi,
+                       __global const float4 *cyl_texA, __global const float4 *cyl_texB,
+                       __global const float4 *plane_pos, __global const float4 *plane_mat,
+                       __global const float4 *plane_emi,
+                       __global const float4 *plane_texA, __global const float4 *plane_texB,
+                       __global const float4 *lpos, __global const float4 *lcol,
+                       __global const float4 *lrad,
+                       __global const float *tris,
+                       __global const float4 *grid_a, __global const uint4 *grid_dims,
+                       __global const uint *grid_off, __global const uint *grid_tri,
+                       const float4 bunny_mat, const float4 bunny_emi,
+                       __global const int *tile_batch, const int tile) {
+    const int lid = (int)get_local_id(0);
+    const int tile_id = (int)get_group_id(0);
+    const int x = tile_batch[tile_id * 2] + lid % tile;
+    const int y = tile_batch[tile_id * 2 + 1] + lid / tile;
+    if (x >= W || y >= H) return;
+
+    float3 result = path_pixel(x, y, W, H, spp,
+                               cam_pos, fwd, right, up, aspect_tan, counts,
+                               tri_count, light_count, fog, sun_dir, sun_col,
+                               sph, sph_mat, sph_emi, sph_texA, sph_texB,
+                               box_min, box_max, box_mat, box_emi, box_texA, box_texB,
+                               cyl_b, cyl_h, cyl_mat, cyl_emi, cyl_texA, cyl_texB,
+                               plane_pos, plane_mat, plane_emi, plane_texA, plane_texB,
+                               lpos, lcol, lrad, tris,
+                               grid_a, grid_dims, grid_off, grid_tri,
+                               bunny_mat, bunny_emi, 1);
+    out[y * W + x] = (float4)(result, 1.0f);
 }
 
 /* ------------------------------------------------------------------ post

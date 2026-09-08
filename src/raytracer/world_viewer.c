@@ -19,6 +19,7 @@
 #include "pitsr.h"
 #define Material RtTracerMaterial
 #include "gpu_renderer.h"
+#include "hybrid.h"
 #include "tracer.h"
 #undef Material
 #ifdef _OPENMP
@@ -195,6 +196,7 @@ int main(int argc, char **argv) {
     int adaptive = 1;
     int adaptive_res = 0;
     int use_gpu = 1;
+    int device = 1;         /* 0 = cpu, 1 = gpu, 2 = both (hybrid tiles) */
     int spp_min = 4;
     int spp_max = 16;
     float scale = 0.67f;    /* upscale mode: internal = output * scale */
@@ -208,6 +210,12 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--adaptive-res") == 0) adaptive_res = 1;
         else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) use_gpu = strcmp(argv[++i], "off") != 0;
+        else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            const char *dev = argv[++i];
+            if (strcmp(dev, "cpu") == 0) { device = 0; use_gpu = 0; }
+            else if (strcmp(dev, "gpu") == 0) device = 1;
+            else if (strcmp(dev, "both") == 0) device = 2;
+        }
         else if (strcmp(argv[i], "--spp-min") == 0 && i + 1 < argc) spp_min = atoi(argv[++i]);
         else if (strcmp(argv[i], "--spp-max") == 0 && i + 1 < argc) spp_max = atoi(argv[++i]);
         else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) { uniform_spp = atoi(argv[++i]); }
@@ -277,7 +285,18 @@ int main(int argc, char **argv) {
     Texture2D texture = LoadTextureFromImage(image);
     free(texture_data);
     SetTextureFilter(texture, TEXTURE_FILTER_POINT);
-    GpuRenderer *gpu = use_gpu ? GpuRenderer_Create(MAX_RENDER_W, MAX_RENDER_H) : NULL;
+    GpuRenderer *gpu = device == 1 && use_gpu ? GpuRenderer_Create(MAX_RENDER_W, MAX_RENDER_H) : NULL;
+    V3 *hdr_film = NULL;
+    int hybrid_ready = 0;
+    if (device == 2) {
+        if (rt_hybrid_prepare(MAX_RENDER_W, MAX_RENDER_H)) {
+            hdr_film = (V3 *)malloc((size_t)MAX_RENDER_W * MAX_RENDER_H * sizeof *hdr_film);
+            hybrid_ready = hdr_film != NULL;
+            if (!hybrid_ready) rt_hybrid_shutdown();
+        } else {
+            fprintf(stderr, "viewer: --device both unavailable, using GPU path\n");
+        }
+    }
     int show_help = 1;
     int startup_screenshot_saved = 0;
     double render_ms = 0.0;
@@ -303,7 +322,19 @@ int main(int argc, char **argv) {
         rt_set_frame_delta(dt);
         int frame_w = MAX_RENDER_W;
         int frame_h = MAX_RENDER_H;
-        int gpu_used = gpu && GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
+        int gpu_used = 0;
+        if (hybrid_ready && !adaptive) {
+            /* Hybrid: GPU pops a tile batch, OpenMP workers trace the rest,
+             * shared CPU post chain tone maps the joined HDR film. */
+            if (rt_render_hybrid_hdr(&scene, hdr_film, frame_w, frame_h,
+                                     frame_spp, 4, NULL) &&
+                rt_postprocess_hdr(hdr_film, rgb, frame_w, frame_h)) {
+                gpu_used = 1;
+            } else {
+                fprintf(stderr, "viewer: hybrid path failed, falling back\n");
+            }
+        }
+        if (!gpu_used) gpu_used = gpu && GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
                                                  internal_w, internal_h, frame_spp, cas);
         if (!gpu_used && !render_parallel(&scene, rgb, frame_w, frame_h, adaptive, adaptive_res,
                                           spp_min, spp_max)) {
@@ -341,7 +372,9 @@ int main(int argc, char **argv) {
 
     UnloadTexture(texture);
     GpuRenderer_Destroy(gpu);
+    rt_hybrid_shutdown();
     CloseWindow();
+    free(hdr_film);
     free(rgba);
     free(rgb);
     return 0;

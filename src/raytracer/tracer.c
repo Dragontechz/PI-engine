@@ -369,6 +369,7 @@ static V3 trace_pixel_samples(const Scene *s, V3 fwd, V3 right, V3 up,
 }
 
 /* ---- Morton-order 16x16 tile queue (tile scheduling for worker threads) ---- */
+#define RT_TILE 16
 typedef struct { unsigned int key; int x, y; } RtTile;
 
 /* Interleave the low 16 bits of x (standard bit scatter, part1by1). */
@@ -386,43 +387,26 @@ static int rt_tile_order_cmp(const void *a, const void *b) {
     return ta->key < tb->key ? -1 : (ta->key > tb->key ? 1 : 0);
 }
 
-static int render_native_hdr(const Scene *s, V3 *hdr, int width, int height,
-                             int spp, int max_depth) {
+/* Render only the listed tile origins (tx, ty pairs) into the HDR film.
+ * Worker threads pop tiles dynamically; pixels are independent (per-pixel
+ * seeds), so the output is identical to a full rt_render_native sweep. */
+int rt_render_tiles_hdr(const Scene *s, V3 *hdr, int width, int height,
+                        int spp, int max_depth, const int *tiles_xy, int tile_count) {
+    if (!s || !hdr || !tiles_xy || tile_count <= 0 || width <= 0 || height <= 0) return 0;
     V3 fwd, right, up;
     float aspect, tanH;
     render_camera_basis(s, width, height, &fwd, &right, &up, &aspect, &tanH);
     if (spp < 1) spp = 1;
-    /* Workers pop 16x16 tiles from a Morton-ordered queue: adjacent tiles are
-     * spatially close, and dynamic scheduling load-balances for free. Pixels
-     * are independent (per-pixel seeds), so ordering cannot change output. */
-    const int tile_size = 16;
-    int tile_w = (width + tile_size - 1) / tile_size;
-    int tile_h = (height + tile_size - 1) / tile_size;
-    int tile_count = tile_w * tile_h;
-    RtTile *order = (RtTile *)malloc((size_t)tile_count * sizeof *order);
-    if (order) {
-        int n = 0;
-        for (int ty = 0; ty < tile_h; ty++) {
-            for (int tx = 0; tx < tile_w; tx++) {
-                order[n].key = morton_expand((unsigned)tx) |
-                               (morton_expand((unsigned)ty) << 1);
-                order[n].x = tx;
-                order[n].y = ty;
-                n++;
-            }
-        }
-        qsort(order, (size_t)tile_count, sizeof *order, rt_tile_order_cmp);
-    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int t = 0; t < tile_count; t++) {
-        int tx = order ? order[t].x : t % tile_w;
-        int ty = order ? order[t].y : t / tile_w;
-        int x0 = tx * tile_size;
-        int y0 = ty * tile_size;
-        int x1 = x0 + tile_size < width ? x0 + tile_size : width;
-        int y1 = y0 + tile_size < height ? y0 + tile_size : height;
+        const int tx = tiles_xy[t * 2 + 0];
+        const int ty = tiles_xy[t * 2 + 1];
+        const int x0 = tx * RT_TILE;
+        const int y0 = ty * RT_TILE;
+        const int x1 = x0 + RT_TILE < width ? x0 + RT_TILE : width;
+        const int y1 = y0 + RT_TILE < height ? y0 + RT_TILE : height;
         for (int y = y0; y < y1; y++) {
             for (int x = x0; x < x1; x++) {
                 hdr[y * width + x] = trace_pixel_samples(
@@ -431,8 +415,56 @@ static int render_native_hdr(const Scene *s, V3 *hdr, int width, int height,
             }
         }
     }
-    free(order);
     return 1;
+}
+
+/* Build a Morton-ordered list of tile origins ((tx, ty) pairs, tile x tile
+ * pixels each) covering a width x height film. If out_xy is NULL, returns
+ * the number of tiles; otherwise writes at most cap tiles and returns the
+ * count written, or -1 if the buffer is too small. */
+int rt_build_tile_origins(int width, int height, int tile, int *out_xy, int cap) {
+    if (tile <= 0 || width <= 0 || height <= 0) return -1;
+    int tile_w = (width + tile - 1) / tile;
+    int tile_h = (height + tile - 1) / tile;
+    int tile_count = tile_w * tile_h;
+    if (!out_xy) return tile_count;
+    if (tile_count > cap) return -1;
+    RtTile *order = (RtTile *)malloc((size_t)tile_count * sizeof *order);
+    if (!order) return -1;
+    int n = 0;
+    for (int ty = 0; ty < tile_h; ty++) {
+        for (int tx = 0; tx < tile_w; tx++) {
+            order[n].key = morton_expand((unsigned)tx) |
+                           (morton_expand((unsigned)ty) << 1);
+            order[n].x = tx;
+            order[n].y = ty;
+            n++;
+        }
+    }
+    qsort(order, (size_t)tile_count, sizeof *order, rt_tile_order_cmp);
+    for (int i = 0; i < tile_count; i++) {
+        out_xy[i * 2 + 0] = order[i].x;
+        out_xy[i * 2 + 1] = order[i].y;
+    }
+    free(order);
+    return tile_count;
+}
+
+static int render_native_hdr(const Scene *s, V3 *hdr, int width, int height,
+                             int spp, int max_depth) {
+    /* Workers pop 16x16 tiles from a Morton-ordered queue: adjacent tiles are
+     * spatially close, and dynamic scheduling load-balances for free. */
+    int tile_count = rt_build_tile_origins(width, height, RT_TILE, NULL, 0);
+    int *tiles_xy = tile_count > 0
+        ? (int *)malloc((size_t)tile_count * 2 * sizeof *tiles_xy) : NULL;
+    int ok = 0;
+    if (tiles_xy &&
+        rt_build_tile_origins(width, height, RT_TILE, tiles_xy, tile_count) == tile_count) {
+        ok = rt_render_tiles_hdr(s, hdr, width, height, spp, max_depth,
+                                 tiles_xy, tile_count);
+    }
+    free(tiles_xy);
+    return ok;
 }
 
 static int render_adaptive_hdr(const Scene *s, V3 *hdr, int width, int height,

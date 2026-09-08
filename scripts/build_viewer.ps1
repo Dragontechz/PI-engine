@@ -18,12 +18,16 @@ if ($need_gen) {
 # NOTE: gpu_renderer.c / gpu_opencl.c must NOT get -march=native: the AVX2
 # codegen crashes inside GpuRenderer_Render on this machine. Plain -O3 is
 # stable, and these files are not compute-hot on the CPU side anyway.
-$base = @('-std=c11', '-O3', '-ffast-math', '-fno-math-errno', '-Wall', '-Wextra', '-Werror', '-fopenmp')
-$simd = @('-march=native', '-mtune=native')
+# -mprefer-vector-width=128 is REQUIRED wherever -march=native is used:
+# GCC emits vmovdqa YMM stack spills that assume 32-byte stack alignment,
+# but Win64 only guarantees 16 -> intermittent SIGSEGV (scene_small was the
+# worst hit; -mstackrealign does not help). 128-bit vectors avoid YMM
+# spills entirely while keeping AVX2 scalar/FMA codegen.
+$simd = @('-march=native', '-mtune=native', '-mprefer-vector-width=128')
 $inc = @('-I', (Join-Path $raylib 'include'), '-I', (Join-Path $root 'src/raytracer'))
 
 $objs = @()
-foreach ($f in @('world_viewer', 'tracer', 'tracer_scene', 'pitsr')) {
+foreach ($f in @('world_viewer', 'tracer', 'tracer_scene', 'pitsr', 'hybrid')) {
     $obj = Join-Path $build "$f.o"
     gcc @base @simd -c (Join-Path $root "src/raytracer/$f.c") -o $obj @inc
     if (-not $?) { throw "Failed to compile $f" }
