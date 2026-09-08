@@ -29,6 +29,7 @@
 #define F_W 20
 #define F_H 21
 #define F_SPP 22
+#define F_SAMPLE_BASE 23
 #define F_COUNTS 24
 #define F_TRI 28
 #define F_LIGHTS 29
@@ -37,6 +38,7 @@
 #define F_SUN_COL 40
 #define F_BMAT 44
 #define F_BEMI 48
+#define F_ACCUM 30
 #define FRAME_FLOATS 52
 #define OCL_GRID_TRI_CAP (OCL_MAX_TRIS * 8)  /* max CSR triangle refs */
 #define OCL_LOG_GROUPS 256   /* rt_logavg partial sums */
@@ -160,6 +162,7 @@ struct OclRenderer {
     int tris_uploaded;
     int tri_count;
     int frames;
+    int accum_samples;
     int broken;
 };
 
@@ -188,14 +191,14 @@ static int resolve_api(struct OclApi *api, HMODULE mod) {
         { "clReleaseProgram", (void **)&api->ReleaseProgram },
         { "clReleaseCommandQueue", (void **)&api->ReleaseCommandQueue },
         { "clReleaseContext", (void **)&api->ReleaseContext },
-        { "clCreateFromGLTexture", (void **)&api->CreateFromGLTexture },
-        { "clEnqueueAcquireGLObjects", (void **)&api->EnqueueAcquireGLObjects },
-        { "clEnqueueReleaseGLObjects", (void **)&api->EnqueueReleaseGLObjects },
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         *table[i].target = (void *)GetProcAddress(mod, table[i].name);
         if (!*table[i].target) return 0;
     }
+    api->CreateFromGLTexture = (pfn_clCreateFromGLTexture)GetProcAddress(mod, "clCreateFromGLTexture");
+    api->EnqueueAcquireGLObjects = (pfn_clEnqueueAcquireGLObjects)GetProcAddress(mod, "clEnqueueAcquireGLObjects");
+    api->EnqueueReleaseGLObjects = (pfn_clEnqueueReleaseGLObjects)GetProcAddress(mod, "clEnqueueReleaseGLObjects");
     return 1;
 }
 
@@ -213,7 +216,7 @@ static void release_all(struct OclRenderer *g) {
                         &g->d_lpos, &g->d_lcol, &g->d_lrad, &g->d_tris,
                         &g->d_grid_a, &g->d_grid_dims, &g->d_grid_off, &g->d_grid_tri,
                         &g->d_rgb_in, &g->d_present, &g->d_cas, &g->d_logpart,
-                        &g->d_tilebuf, &g->d_gl };
+                         &g->d_tilebuf, &g->d_gl, &g->d_frame };
         for (size_t i = 0; i < sizeof mems / sizeof mems[0]; i++) {
             if (*mems[i]) g->api.ReleaseMemObject(*mems[i]);
         }
@@ -318,6 +321,11 @@ OclRenderer *Ocl_Create(int width, int height) {
         ctx_props[3] = (intptr_t)gl_dc;
     }
     g->ctx = g->api.CreateContext(ctx_props, 1, &dev, NULL, NULL, &err);
+    if ((!g->ctx || err != CL_SUCCESS) && gl_ctx && gl_dc) {
+        intptr_t no_gl_props[1] = { 0 };
+        err = 0;
+        g->ctx = g->api.CreateContext(no_gl_props, 1, &dev, NULL, NULL, &err);
+    }
     OCL_LOG("context created");
     if (err != CL_SUCCESS || !g->ctx) { release_all(g); free(g); return NULL; }
     g->queue = g->api.CreateCommandQueue(g->ctx, dev, 0, &err);
@@ -354,7 +362,7 @@ OclRenderer *Ocl_Create(int width, int height) {
     }
     OCL_LOG("kernel created");
 
-    g->d_out = make_buffer(g, CL_MEM_WRITE_ONLY, (size_t)OCL_MAX_W * OCL_MAX_H * 16);
+    g->d_out = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 16);
     g->d_sph = make_buffer(g, CL_MEM_READ_ONLY, OCL_MAX_SPHERES * 16);
     g->d_sph_mat = make_buffer(g, CL_MEM_READ_ONLY, OCL_MAX_SPHERES * 16);
     g->d_sph_emi = make_buffer(g, CL_MEM_READ_ONLY, OCL_MAX_SPHERES * 16);
@@ -620,6 +628,7 @@ struct OclSceneInfo { int ns, nb, nc, npl, nl; int nargs; };
 
 static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
                             int film_w, int film_h, float aspect, int spp,
+                            int sample_base, int accumulating,
                             struct OclSceneInfo *info) {
     (void)kernel; /* args bound once in Ocl_Create */
     if (!upload_triangles(g, s)) { g->broken = 1; return 0; }
@@ -843,6 +852,8 @@ static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
     frame[F_W] = (float)film_w;
     frame[F_H] = (float)film_h;
     frame[F_SPP] = (float)spp;
+    frame[F_SAMPLE_BASE] = (float)sample_base;
+    frame[F_ACCUM] = (float)accumulating;
     frame[F_COUNTS] = (float)ns;
     frame[F_COUNTS + 1] = (float)nb;
     frame[F_COUNTS + 2] = (float)nc;
@@ -894,23 +905,40 @@ int Ocl_AttachGlTexture(OclRenderer *g, unsigned tex_id, int width, int height) 
     return 1;
 }
 
-int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
+static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rgb,
                int width, int height, int internal_w, int internal_h,
-               int spp, float cas) {
+               int spp, float cas, int accumulate) {
     if (!g || g->broken || !s || !rgb || width <= 0 || height <= 0) return 0;
     if (width > OCL_MAX_W || height > OCL_MAX_H) return 0;
     if (internal_w <= 0 || internal_h <= 0) { internal_w = width; internal_h = height; }
     if (internal_w > OCL_MAX_W || internal_h > OCL_MAX_H) return 0;
     if (spp < 1) spp = 1;
+    if (!accumulate) g->accum_samples = 0;
     if (cas < 0.0f) cas = 0.0f;
     if (cas > 1.0f) cas = 1.0f;
     const int upscaling = internal_w != width || internal_h != height;
+    struct OclApi *api = &g->api;
 
     struct OclSceneInfo info;
     /* ray generation uses the presentation aspect, exactly like before */
+    const int sample_base = accumulate ? g->accum_samples : 0;
     if (!ocl_upload_scene(g, s, g->kernel, internal_w, internal_h,
-                          (float)width / (float)height, spp, &info)) return 0;
-    struct OclApi *api = &g->api;
+                          (float)width / (float)height, spp,
+                          sample_base, accumulate, &info)) return 0;
+    if (accumulate && sample_base == 0) {
+        static unsigned char *zeroes;
+        static size_t zeroes_size;
+        const size_t bytes = (size_t)internal_w * internal_h * 16;
+        if (zeroes_size < bytes) {
+            free(zeroes);
+            zeroes = (unsigned char *)calloc(bytes, 1);
+            zeroes_size = zeroes ? bytes : 0;
+        }
+        if (!zeroes || api_wb(g, g->d_out, zeroes, bytes) != CL_SUCCESS) {
+            g->broken = 1;
+            return 0;
+        }
+    }
     clh d_out = g->d_out;
 
     /* padded 2D workgroups keep the HD 620's SIMD lanes fully occupied even
@@ -1068,7 +1096,23 @@ int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
                 internal_w, internal_h);
         fflush(stderr);
     }
+    if (accumulate) g->accum_samples += spp;
     return 1;
+}
+
+int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
+               int width, int height, int internal_w, int internal_h,
+               int spp, float cas) {
+    return ocl_render_internal(g, s, rgb, width, height, internal_w, internal_h,
+                               spp, cas, 0);
+}
+
+int Ocl_RenderAccum(OclRenderer *g, const Scene *s, unsigned char *rgb,
+                    int width, int height, int internal_w, int internal_h,
+                    int spp, float cas, int reset) {
+    if (reset) g->accum_samples = 0;
+    return ocl_render_internal(g, s, rgb, width, height, internal_w, internal_h,
+                               spp, cas, 1);
 }
 
 /* Hybrid mode, phase 1: enqueue an rt_tiles kernel over the given tile batch
@@ -1086,7 +1130,7 @@ int Ocl_TraceTiles(OclRenderer *g, const Scene *s, int width, int height,
     struct OclSceneInfo info;
     /* film aspect: matches the CPU ray generator pixel for pixel */
     if (!ocl_upload_scene(g, s, g->k_tiles, width, height,
-                          (float)width / (float)height, spp, &info)) return 0;
+                          (float)width / (float)height, spp, 0, 0, &info)) return 0;
     struct OclApi *api = &g->api;
 
     if (api->EnqueueWriteBuffer(g->queue, g->d_tilebuf, CL_FALSE, 0,

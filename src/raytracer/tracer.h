@@ -135,6 +135,9 @@ int rt_render_exact_fast(const Scene *scene, unsigned char *rgb, int width, int 
                          int shadow_samples, int max_depth);
 int rt_render_native(const Scene *scene, unsigned char *rgb, int width, int height,
                      int spp, int max_depth);
+/* Add deterministic samples [sample_base, sample_base+spp) into hdr. */
+int rt_render_progressive_hdr(const Scene *scene, V3 *hdr, int width, int height,
+                              int spp, int sample_base, int max_depth);
 /* Trace only the listed tile origins (tx, ty pairs, tile size 16) into an
  * HDR film of width x height pixels; worker threads pop tiles dynamically. */
 int rt_render_tiles_hdr(const Scene *scene, V3 *hdr, int width, int height,

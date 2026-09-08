@@ -548,6 +548,16 @@ int GpuRenderer_Render(GpuRenderer *g, const Scene *s, unsigned char *rgb,
     return 1;
 }
 
+int GpuRenderer_RenderAccum(GpuRenderer *g, const Scene *s, unsigned char *rgb,
+                            int width, int height, int internal_w, int internal_h,
+                            int spp, float cas, int reset) {
+    if (!g || g->broken || g->backend != 1 || !g->ocl) return 0;
+    if (Ocl_RenderAccum((OclRenderer *)g->ocl, s, rgb, width, height,
+                        internal_w, internal_h, spp, cas, reset)) return 1;
+    g->broken = 1;
+    return 0;
+}
+
 void GpuRenderer_Destroy(GpuRenderer *g) {
     if (!g) return;
     if (g->ocl) {

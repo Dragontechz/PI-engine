@@ -18,6 +18,10 @@ int GpuRenderer_Render(GpuRenderer *gpu, const Scene *scene, unsigned char *rgb,
                        int width, int height, int internal_w, int internal_h,
                        int spp, float cas);
 
+int GpuRenderer_RenderAccum(GpuRenderer *gpu, const Scene *scene, unsigned char *rgb,
+                            int width, int height, int internal_w, int internal_h,
+                            int spp, float cas, int reset);
+
 void GpuRenderer_Destroy(GpuRenderer *gpu);
 
 /* Share raylib's texture with the OpenCL device for zero-copy presentation

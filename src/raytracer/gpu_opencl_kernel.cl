@@ -25,6 +25,7 @@
 #define F_W 20
 #define F_H 21
 #define F_SPP 22
+#define F_SAMPLE_BASE 23
 #define F_COUNTS 24
 #define F_TRI 28
 #define F_LIGHTS 29
@@ -33,6 +34,7 @@
 #define F_SUN_COL 40
 #define F_BMAT 44
 #define F_BEMI 48
+#define F_ACCUM 30
 #define FRAME_FLOATS 52
 
 struct Hit { float t; float3 n; int kind; int idx; };
@@ -547,7 +549,8 @@ void fetch_material(const int kind, const int idx,
  * depends on which device rendered it; rt_main keeps the legacy seed-once
  * stream. */
 float3 path_pixel(const int x, const int y, const int W, const int H,
-                  const int spp,
+                   const int spp,
+                   const int sample_base,
                   const float4 cam_pos, const float4 fwd, const float4 right,
                   const float4 up, const float2 aspect_tan, const int4 counts,
                   const int tri_count, const int light_count,
@@ -576,7 +579,8 @@ float3 path_pixel(const int x, const int y, const int W, const int H,
     int sample_count = spp < 1 ? 1 : spp;
 
     for (int sample = 0; sample < sample_count; sample++) {
-        if (per_sample_seed != 0) rng = pixel_seed(x, y) + (uint)sample * 0x9e3779b9u;
+        if (per_sample_seed != 0) rng = pixel_seed(x, y) +
+            (uint)(sample_base + sample) * 0x9e3779b9u;
         float jx = rng_float(&rng);
         float jy = rng_float(&rng);
         float u = ((float)x + jx) / (float)W * 2.0f - 1.0f;
@@ -690,9 +694,11 @@ __kernel void rt_main(__global float4 *out, __global const float *frame,
     const float4 sun_col = vload4(0, frame + F_SUN_COL);
     const float4 bunny_mat = vload4(0, frame + F_BMAT);
     const float4 bunny_emi = vload4(0, frame + F_BEMI);
-    const int spp = (int)frame[F_SPP];
+     const int spp = (int)frame[F_SPP];
+     const int sample_base = (int)frame[F_SAMPLE_BASE];
+     const int accumulating = (int)frame[F_ACCUM];
 
-    float3 result = path_pixel(x, y, W, H, spp,
+     float3 result = path_pixel(x, y, W, H, spp, sample_base,
                                cam_pos, fwd, right, up, aspect_tan, counts,
                                tri_count, light_count, fog, sun_dir, sun_col,
                                sph, sph_mat, sph_emi, sph_texA, sph_texB,
@@ -701,10 +707,18 @@ __kernel void rt_main(__global float4 *out, __global const float *frame,
                                plane_pos, plane_mat, plane_emi, plane_texA, plane_texB,
                                lpos, lcol, lrad, tris,
                                grid_a, grid_dims, grid_off, grid_tri,
-                               bunny_mat, bunny_emi, 0);
+                                bunny_mat, bunny_emi, accumulating ? 1 : 0);
 
-    const int o = y * W + x;
-    out[o] = (float4)(result, 1.0f);
+     const int o = y * W + x;
+     if (accumulating) {
+         const float old_count = (float)sample_base;
+         const float new_count = old_count + (float)(spp < 1 ? 1 : spp);
+         float3 old = out[o].xyz;
+         result = old_count > 0.0f
+             ? (old * old_count + result * (float)spp) / new_count
+             : result;
+     }
+     out[o] = (float4)(result, 1.0f);
 }
 
 /* Hybrid tile worker: one workgroup per tile (tile*tile work-items),
@@ -754,7 +768,7 @@ __kernel void rt_tiles(__global float4 *out, __global const float *frame,
     const float4 bunny_emi = vload4(0, frame + F_BEMI);
     const int spp = (int)frame[F_SPP];
 
-    float3 result = path_pixel(x, y, W, H, spp,
+     float3 result = path_pixel(x, y, W, H, spp, 0,
                                cam_pos, fwd, right, up, aspect_tan, counts,
                                tri_count, light_count, fog, sun_dir, sun_col,
                                sph, sph_mat, sph_emi, sph_texA, sph_texB,
@@ -916,6 +930,10 @@ __kernel void rt_present(__global const uchar4 *src, __write_only image2d_t dst,
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
     if (x >= W || y >= H) return;
-    const uchar4 c = src[y * W + x];
-    write_imageui(dst, (int2)(x, y), (uint4)(c.x, c.y, c.z, 255u));
+     const uchar4 c = src[y * W + x];
+     /* GL_RGBA8 is a normalized image: integer writes produce black on the
+      * Intel sharing path, while normalized float writes preserve RGBA8. */
+     write_imagef(dst, (int2)(x, y),
+                  (float4)((float)c.x / 255.0f, (float)c.y / 255.0f,
+                           (float)c.z / 255.0f, 1.0f));
 }

@@ -202,6 +202,7 @@ int main(int argc, char **argv) {
     float scale = 0.58f;    /* upscale mode: internal = output * scale */
     float cas = 0.4f;       /* upscale mode: CAS sharpen after upscale */
     int uniform_spp = 0;    /* upscale/native mode: explicit --spp */
+    int accumulate = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
@@ -221,6 +222,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) { uniform_spp = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--cas") == 0 && i + 1 < argc) cas = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--accumulate") == 0 && i + 1 < argc)
+            accumulate = atoi(argv[++i]) != 0;
+        else if (strncmp(argv[i], "--accumulate=", 13) == 0)
+            accumulate = atoi(argv[i] + 13) != 0;
         else if (strcmp(argv[i], "--upscaler") == 0 && i + 1 < argc) {
             if (strcmp(argv[++i], "none") == 0) scale = 1.0f;
         }
@@ -252,6 +257,11 @@ int main(int argc, char **argv) {
     if (scale >= 1.0f) { internal_w = MAX_RENDER_W; internal_h = MAX_RENDER_H; }
     unsigned char *rgb = (unsigned char *)malloc((size_t)MAX_RENDER_W * MAX_RENDER_H * 3);
     if (!rgb) return 1;
+    V3 *cpu_accum = (V3 *)calloc((size_t)MAX_RENDER_W * MAX_RENDER_H, sizeof *cpu_accum);
+    if (!cpu_accum) {
+        free(rgb);
+        return 1;
+    }
     unsigned char *rgba = (unsigned char *)malloc((size_t)MAX_RENDER_W * MAX_RENDER_H * 4);
     if (!rgba) {
         free(rgb);
@@ -288,7 +298,11 @@ int main(int argc, char **argv) {
     /* device 1 = GPU-only, device 2 = hybrid for native mode but still GPU
      * for adaptive/upscale modes (hybrid renders full-res tiles only). */
     GpuRenderer *gpu = device >= 1 && use_gpu ? GpuRenderer_Create(MAX_RENDER_W, MAX_RENDER_H) : NULL;
-    if (gpu)
+    /* The Intel HD 620 sharing path currently writes a valid CL image but
+     * raylib does not see the released texture contents reliably. Keep the
+     * proven readback presentation as the default until that driver path is
+     * isolated; set RT_GL_INTEROP=1 to opt into it for diagnostics. */
+    if (gpu && getenv("RT_GL_INTEROP"))
         GpuRenderer_AttachGlTexture(gpu, (unsigned)texture.id, MAX_RENDER_W, MAX_RENDER_H);
     V3 *hdr_film = NULL;
     int hybrid_ready = 0;
@@ -306,6 +320,8 @@ int main(int argc, char **argv) {
     int profile = getenv("RT_PROFILE") != NULL;
     double render_ms = 0.0;
     int frame_index = 0;
+    int accumulation_reset = 1;
+    ViewerCamera accumulated_camera = camera;
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
@@ -322,16 +338,25 @@ int main(int argc, char **argv) {
         int balls_moved = update_pushable_balls(&scene, camera_delta, camera.position);
         if (balls_moved) rt_build_accel(&scene);
         update_scene_camera(&scene, &camera);
+        if (camera.position.x != accumulated_camera.position.x ||
+            camera.position.y != accumulated_camera.position.y ||
+            camera.position.z != accumulated_camera.position.z ||
+            camera.yaw != accumulated_camera.yaw || camera.pitch != accumulated_camera.pitch ||
+            balls_moved) {
+            accumulation_reset = 1;
+            accumulated_camera = camera;
+        }
 
         double start = GetTime();
         rt_set_frame_delta(dt);
         int frame_w = MAX_RENDER_W;
         int frame_h = MAX_RENDER_H;
         int gpu_used = 0;
+        int gl_presented = 0;
         double t_render = 0.0, t_present = 0.0;
         /* Hybrid tiles are a native-res feature; upscale mode must keep the
          * reduced-res GPU path (hybrid at 1280x720 is CPU-bound). */
-        if (hybrid_ready && !adaptive && !adaptive_res) {
+        if (hybrid_ready && !accumulate && !adaptive && !adaptive_res) {
             /* Hybrid: GPU pops a tile batch, OpenMP workers trace the rest,
              * shared CPU post chain tone maps the joined HDR film. */
             if (rt_render_hybrid_hdr(&scene, hdr_film, frame_w, frame_h,
@@ -344,23 +369,39 @@ int main(int argc, char **argv) {
         }
         if (!gpu_used) {
             double gq0 = GetTime();
-            gpu_used = gpu && GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
-                                                 internal_w, internal_h, frame_spp, cas);
+            gpu_used = gpu && (accumulate
+                ? GpuRenderer_RenderAccum(gpu, &scene, rgb, frame_w, frame_h,
+                                           internal_w, internal_h, frame_spp, cas,
+                                           accumulation_reset)
+                : GpuRenderer_Render(gpu, &scene, rgb, frame_w, frame_h,
+                                      internal_w, internal_h, frame_spp, cas));
+            gl_presented = gpu_used && GpuRenderer_GlInterop(gpu);
             if (profile && (frame_index <= 5 || frame_index % 30 == 0))
                 fprintf(stderr, "prof: GpuRenderer_Render %.1f ms\n",
                         (GetTime() - gq0) * 1000.0);
         }
-        if (!gpu_used && !render_parallel(&scene, rgb, frame_w, frame_h, adaptive, adaptive_res,
-                                          spp_min, spp_max)) {
+        if (!gpu_used && accumulate) {
+            static int cpu_samples;
+            if (accumulation_reset) cpu_samples = 0;
+            if (!rt_render_progressive_hdr(&scene, cpu_accum, frame_w, frame_h,
+                                           frame_spp, cpu_samples, 4) ||
+                !rt_postprocess_hdr(cpu_accum, rgb, frame_w, frame_h)) {
+                TraceLog(LOG_ERROR, "CPU accumulation failed");
+                break;
+            }
+            cpu_samples += frame_spp;
+        } else if (!gpu_used && !render_parallel(&scene, rgb, frame_w, frame_h, adaptive, adaptive_res,
+                                                 spp_min, spp_max)) {
             TraceLog(LOG_ERROR, "Ray-traced frame failed");
             break;
         }
+        accumulation_reset = 0;
         (void)frame_index++;
         t_render = (GetTime() - start) * 1000.0;
         render_ms = t_render;
         double t0p = GetTime();
         /* With CL-GL interop the GPU already wrote the shared texture. */
-        if (!(gpu_used && GpuRenderer_GlInterop(gpu)))
+        if (!gl_presented)
             present_rgb(texture, rgb, rgba, frame_w, frame_h);
         t_present = (GetTime() - t0p) * 1000.0;
         if (profile && (frame_index <= 5 || frame_index % 30 == 0)) {
@@ -399,6 +440,7 @@ int main(int argc, char **argv) {
     rt_hybrid_shutdown();
     CloseWindow();
     free(hdr_film);
+    free(cpu_accum);
     free(rgba);
     free(rgb);
     return 0;

@@ -10,7 +10,7 @@
  * unavailable or fails. */
 typedef struct OclRenderer OclRenderer;
 
-/* May be called before or after InitWindow (no GL interop used). */
+/* Must be called after InitWindow when GL presentation is desired. */
 OclRenderer *Ocl_Create(int width, int height);
 
 /* Share raylib's GL texture with the OpenCL device (cl_khr_gl_sharing). On
@@ -29,6 +29,13 @@ int Ocl_GlInterop(const OclRenderer *gpu);
 int Ocl_Render(OclRenderer *gpu, const Scene *scene, unsigned char *rgb,
                int width, int height, int internal_w, int internal_h,
                int spp, float cas);
+
+/* Progressive HDR accumulation. Each successful call adds spp deterministic
+ * samples per pixel and tone maps the running average. reset discards the
+ * previous running average before rendering this pass. */
+int Ocl_RenderAccum(OclRenderer *gpu, const Scene *scene, unsigned char *rgb,
+                    int width, int height, int internal_w, int internal_h,
+                    int spp, float cas, int reset);
 
 /* Hybrid tile workers: enqueue a kernel covering the listed tile origins
  * ((tx, ty) pairs, tile x tile work-items each; tile is 8 or 16) without

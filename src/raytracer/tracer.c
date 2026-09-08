@@ -343,14 +343,16 @@ static V3 path_radiance(const Scene *s, V3 ro, V3 rd, unsigned int *rng,
 
 static V3 trace_pixel_samples(const Scene *s, V3 fwd, V3 right, V3 up,
                               float aspect, float tanH, int x, int y,
-                              int width, int height, int samples, int max_depth,
+                              int width, int height, int samples, int sample_base,
+                              int max_depth,
                               float *mean_luminance, int *primary_object) {
     V3 sum = v3(0, 0, 0);
     float luminance_sum = 0.0f;
     int object = -1;
     if (samples < 1) samples = 1;
     for (int sample = 0; sample < samples; sample++) {
-        unsigned int rng = pixel_seed(x, y) + (unsigned int)sample * 0x9e3779b9u;
+        unsigned int rng = pixel_seed(x, y) +
+                           (unsigned int)(sample_base + sample) * 0x9e3779b9u;
         float jx = rng_float(&rng);
         float jy = rng_float(&rng);
         float u = ((float)x + jx) / (float)width * 2.0f - 1.0f;
@@ -411,7 +413,7 @@ int rt_render_tiles_hdr(const Scene *s, V3 *hdr, int width, int height,
             for (int x = x0; x < x1; x++) {
                 hdr[y * width + x] = trace_pixel_samples(
                     s, fwd, right, up, aspect, tanH, x, y, width, height,
-                    spp, max_depth, NULL, NULL);
+                    spp, 0, max_depth, NULL, NULL);
             }
         }
     }
@@ -582,6 +584,45 @@ int rt_render_native(const Scene *s, unsigned char *rgb, int width, int height,
              postprocess_hdr(hdr, rgb, width, height);
     free(hdr);
     return ok;
+}
+
+int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
+                              int spp, int sample_base, int max_depth) {
+    if (!s || !hdr || width <= 0 || height <= 0 || spp <= 0 || sample_base < 0)
+        return 0;
+    int tile_count = rt_build_tile_origins(width, height, RT_TILE, NULL, 0);
+    int *tiles_xy = tile_count > 0
+        ? (int *)malloc((size_t)tile_count * 2 * sizeof *tiles_xy) : NULL;
+    if (!tiles_xy || rt_build_tile_origins(width, height, RT_TILE, tiles_xy, tile_count) != tile_count) {
+        free(tiles_xy);
+        return 0;
+    }
+    V3 fwd, right, up;
+    float aspect, tanH;
+    render_camera_basis(s, width, height, &fwd, &right, &up, &aspect, &tanH);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int t = 0; t < tile_count; t++) {
+        int x0 = tiles_xy[t * 2 + 0] * RT_TILE;
+        int y0 = tiles_xy[t * 2 + 1] * RT_TILE;
+        int x1 = x0 + RT_TILE < width ? x0 + RT_TILE : width;
+        int y1 = y0 + RT_TILE < height ? y0 + RT_TILE : height;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                V3 c = trace_pixel_samples(s, fwd, right, up, aspect, tanH,
+                                            x, y, width, height, spp, sample_base,
+                                            max_depth, NULL, NULL);
+                int n = sample_base + spp;
+                hdr[y * width + x] = sample_base > 0
+                    ? vscale(vadd(vscale(hdr[y * width + x], (float)sample_base),
+                                  vscale(c, (float)spp)), 1.0f / (float)n)
+                    : c;
+            }
+        }
+    }
+    free(tiles_xy);
+    return 1;
 }
 
 int rt_postprocess_hdr(const V3 *hdr, unsigned char *rgb, int width, int height) {
