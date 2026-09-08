@@ -12,16 +12,62 @@ static void mesh_triangle_bounds(const RtMesh *mesh, int triangle, V3 *mn, V3 *m
     *mn=v3(fminf(a.x,fminf(b.x,c.x)),fminf(a.y,fminf(b.y,c.y)),fminf(a.z,fminf(b.z,c.z)));
     *mx=v3(fmaxf(a.x,fmaxf(b.x,c.x)),fmaxf(a.y,fmaxf(b.y,c.y)),fmaxf(a.z,fmaxf(b.z,c.z)));
 }
-static float mesh_centroid(const RtMesh *mesh,int tri,int axis){V3 mn,mx;mesh_triangle_bounds(mesh,tri,&mn,&mx);V3 c=vscale(vadd(mn,mx),.5f);return axis==0?c.x:axis==1?c.y:c.z;}
-static int mesh_build_node(RtMesh *mesh,int start,int count){
+static float mesh_bounds_area(V3 mn,V3 mx){float ex=fmaxf(mx.x-mn.x,0.f),ey=fmaxf(mx.y-mn.y,0.f),ez=fmaxf(mx.z-mn.z,0.f);return 2.f*(ex*ey+ey*ez+ez*ex);}
+/* Binned SAH node over triangle centroids; falls back to a leaf when no
+ * split pays for its own traversal (see tracer.c build_accel_node). */
+static int mesh_build_node(RtMesh *mesh,int start,int count,int depth){
     int id=mesh->node_count++; RtMeshNode *node=&mesh->nodes[id];
     V3 mn=v3(1e30f,1e30f,1e30f),mx=v3(-1e30f,-1e30f,-1e30f);
-    for(int i=start;i<start+count;i++){V3 a,b;mesh_triangle_bounds(mesh,mesh->triangle_indices[i],&a,&b);mn.x=fminf(mn.x,a.x);mn.y=fminf(mn.y,a.y);mn.z=fminf(mn.z,a.z);mx.x=fmaxf(mx.x,b.x);mx.y=fmaxf(mx.y,b.y);mx.z=fmaxf(mx.z,b.z);}
+    V3 cmn=v3(1e30f,1e30f,1e30f),cmx=v3(-1e30f,-1e30f,-1e30f);
+    for(int i=start;i<start+count;i++){V3 a,b;mesh_triangle_bounds(mesh,mesh->triangle_indices[i],&a,&b);
+        mn.x=fminf(mn.x,a.x);mn.y=fminf(mn.y,a.y);mn.z=fminf(mn.z,a.z);mx.x=fmaxf(mx.x,b.x);mx.y=fmaxf(mx.y,b.y);mx.z=fmaxf(mx.z,b.z);
+        V3 c=vscale(vadd(a,b),.5f);cmn.x=fminf(cmn.x,c.x);cmn.y=fminf(cmn.y,c.y);cmn.z=fminf(cmn.z,c.z);cmx.x=fmaxf(cmx.x,c.x);cmx.y=fmaxf(cmx.y,c.y);cmx.z=fmaxf(cmx.z,c.z);}
     node->min=mn;node->max=mx;node->left=node->right=-1;node->start=start;node->count=count;
-    if(count<=8)return id;
-    V3 e=vsub(mx,mn);int axis=e.x>e.y&&e.x>e.z?0:e.y>e.z?1:2;
-    for(int i=start+1;i<start+count;i++){int key=mesh->triangle_indices[i];float value=mesh_centroid(mesh,key,axis);int j=i-1;while(j>=start&&mesh_centroid(mesh,mesh->triangle_indices[j],axis)>value){mesh->triangle_indices[j+1]=mesh->triangle_indices[j];j--;}mesh->triangle_indices[j+1]=key;}
-    int left=count/2;node->left=mesh_build_node(mesh,start,left);node->right=mesh_build_node(mesh,start+left,count-left);node->count=0;return id;
+    if(count<=2||depth>=RT_SAH_MAX_DEPTH||mesh->node_count+2>RT_MAX_MESH_NODES)return id;
+    float ex=cmx.x-cmn.x,ey=cmx.y-cmn.y,ez=cmx.z-cmn.z;
+    int axis=ex>ey&&ex>ez?0:ey>ez?1:2;
+    float cmin=axis==0?cmn.x:axis==1?cmn.y:cmn.z;
+    float extent=axis==0?ex:axis==1?ey:ez;
+    float node_area=mesh_bounds_area(mn,mx);
+    if(extent<=1e-6f||node_area<=0.f)return id;
+    V3 bin_mn[RT_SAH_BINS],bin_mx[RT_SAH_BINS];int bin_count[RT_SAH_BINS];
+    for(int b=0;b<RT_SAH_BINS;b++){bin_mn[b]=v3(1e30f,1e30f,1e30f);bin_mx[b]=v3(-1e30f,-1e30f,-1e30f);bin_count[b]=0;}
+    for(int i=start;i<start+count;i++){V3 a,b;mesh_triangle_bounds(mesh,mesh->triangle_indices[i],&a,&b);
+        V3 c=vscale(vadd(a,b),.5f);float t=axis==0?c.x:axis==1?c.y:c.z;
+        int bin=(int)((t-cmin)/extent*(float)RT_SAH_BINS);if(bin<0)bin=0;if(bin>=RT_SAH_BINS)bin=RT_SAH_BINS-1;
+        bin_mn[bin].x=fminf(bin_mn[bin].x,a.x);bin_mn[bin].y=fminf(bin_mn[bin].y,a.y);bin_mn[bin].z=fminf(bin_mn[bin].z,a.z);
+        bin_mx[bin].x=fmaxf(bin_mx[bin].x,b.x);bin_mx[bin].y=fmaxf(bin_mx[bin].y,b.y);bin_mx[bin].z=fmaxf(bin_mx[bin].z,b.z);
+        bin_count[bin]++;}
+    V3 suf_mn[RT_SAH_BINS],suf_mx[RT_SAH_BINS];int suf_count[RT_SAH_BINS];
+    V3 amn=v3(1e30f,1e30f,1e30f),amx=v3(-1e30f,-1e30f,-1e30f);int ac=0;
+    for(int b=RT_SAH_BINS-1;b>=0;b--){
+        amn.x=fminf(amn.x,bin_mn[b].x);amn.y=fminf(amn.y,bin_mn[b].y);amn.z=fminf(amn.z,bin_mn[b].z);
+        amx.x=fmaxf(amx.x,bin_mx[b].x);amx.y=fmaxf(amx.y,bin_mx[b].y);amx.z=fmaxf(amx.z,bin_mx[b].z);
+        ac+=bin_count[b];suf_mn[b]=amn;suf_mx[b]=amx;suf_count[b]=ac;}
+    amn=v3(1e30f,1e30f,1e30f);amx=v3(-1e30f,-1e30f,-1e30f);ac=0;
+    float best_cost=RT_SAH_PRIM_COST*(float)count;int best_split=-1;
+    for(int b=0;b<RT_SAH_BINS-1;b++){
+        amn.x=fminf(amn.x,bin_mn[b].x);amn.y=fminf(amn.y,bin_mn[b].y);amn.z=fminf(amn.z,bin_mn[b].z);
+        amx.x=fmaxf(amx.x,bin_mx[b].x);amx.y=fmaxf(amx.y,bin_mx[b].y);amx.z=fmaxf(amx.z,bin_mx[b].z);
+        ac+=bin_count[b];
+        if(ac==0)continue;
+        if(suf_count[b+1]==0)break;
+        float cost=RT_SAH_TRAV_COST+RT_SAH_PRIM_COST*
+            ((float)ac*mesh_bounds_area(amn,amx)+(float)suf_count[b+1]*mesh_bounds_area(suf_mn[b+1],suf_mx[b+1]))/node_area;
+        if(cost<best_cost){best_cost=cost;best_split=b;}}
+    if(best_split<0)return id;
+    int i=start,j=start+count-1;
+    while(i<=j){
+        V3 a,b;mesh_triangle_bounds(mesh,mesh->triangle_indices[i],&a,&b);
+        V3 c=vscale(vadd(a,b),.5f);float t=axis==0?c.x:axis==1?c.y:c.z;
+        int bin=(int)((t-cmin)/extent*(float)RT_SAH_BINS);if(bin<0)bin=0;if(bin>=RT_SAH_BINS)bin=RT_SAH_BINS-1;
+        if(bin<=best_split){i++;}
+        else{int tri=mesh->triangle_indices[i];mesh->triangle_indices[i]=mesh->triangle_indices[j];mesh->triangle_indices[j]=tri;j--;}}
+    int left=i-start;
+    if(left==0||left==count)return id;
+    node->left=mesh_build_node(mesh,start,left,depth+1);
+    node->right=mesh_build_node(mesh,start+left,count-left,depth+1);
+    node->count=0;return id;
 }
 
 static int mesh_load_ply(RtMesh *mesh, const char *path, V3 position, float scale) {
@@ -56,7 +102,7 @@ static int mesh_load_ply(RtMesh *mesh, const char *path, V3 position, float scal
     fclose(f);
     mesh->node_count = 0;
     for (int i = 0; i < mesh->triangle_count; i++) mesh->triangle_indices[i] = i;
-    if (mesh->triangle_count > 0) mesh_build_node(mesh, 0, mesh->triangle_count);
+    if (mesh->triangle_count > 0) mesh_build_node(mesh, 0, mesh->triangle_count, 0);
     return mesh->triangle_count > 0;
 }
 
@@ -99,7 +145,7 @@ static int mesh_load_obj(RtMesh *mesh, const char *path, V3 position, float scal
     fclose(f);
     mesh->node_count = 0;
     for (int i = 0; i < mesh->triangle_count; i++) mesh->triangle_indices[i] = i;
-    if (mesh->triangle_count > 0) mesh_build_node(mesh, 0, mesh->triangle_count);
+    if (mesh->triangle_count > 0) mesh_build_node(mesh, 0, mesh->triangle_count, 0);
     return mesh->triangle_count > 0;
 }
 

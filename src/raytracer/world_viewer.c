@@ -223,6 +223,13 @@ int main(int argc, char **argv) {
     }
     if (spp_min < 1) spp_min = 1;
     if (spp_max < spp_min) spp_max = spp_min;
+    /* Explicit --spp is uniform: it must reach the CPU paths too, not just
+     * frame_spp for the GPU (native renders with spp_max, adaptive with
+     * spp_min..spp_max; pinning both makes it truly uniform). */
+    if (uniform_spp > 0) {
+        spp_min = uniform_spp;
+        spp_max = uniform_spp;
+    }
     if (scale < 0.25f) scale = 0.25f;
     if (scale > 1.0f) scale = 1.0f;
     if (cas < 0.0f) cas = 0.0f;
@@ -305,7 +312,7 @@ int main(int argc, char **argv) {
         }
         (void)frame_index++;
         render_ms = (GetTime() - start) * 1000.0;
-        if (frame_index % 120 == 0) {
+        if (frame_index % 30 == 0 || frame_index <= 3) {
             TraceLog(LOG_INFO, "frame %d: %.1f ms (%.1f fps)", frame_index, render_ms,
                      render_ms > 0.0 ? 1000.0 / render_ms : 0.0);
         }
@@ -319,7 +326,6 @@ int main(int argc, char **argv) {
                        (Rectangle){0, 0, MAX_RENDER_W, MAX_RENDER_H},
                        (Rectangle){0, 0, (float)view_w, (float)view_h},
                        (Vector2){0, 0}, 0.0f, WHITE);
-        DrawCircle(view_w / 2, view_h / 2, 2.0f, (Color){255, 220, 150, 220});
         draw_hud(render_ms, show_help, gpu != NULL);
         EndDrawing();
         if (!startup_screenshot_saved) {

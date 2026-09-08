@@ -72,6 +72,11 @@ typedef struct {
 #define RT_MAX_OBJECTS 192
 #define RT_MAX_LIGHTS 8
 #define RT_EPSILON 0.0005f
+/* Binned SAH build constants shared by the object and mesh BVH builders. */
+#define RT_SAH_BINS 12
+#define RT_SAH_TRAV_COST 1.0f
+#define RT_SAH_PRIM_COST 1.5f
+#define RT_SAH_MAX_DEPTH 32
 typedef struct {
     V3 position;
     V3 color;

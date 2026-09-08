@@ -368,19 +368,70 @@ static V3 trace_pixel_samples(const Scene *s, V3 fwd, V3 right, V3 up,
     return vscale(sum, inv);
 }
 
+/* ---- Morton-order 16x16 tile queue (tile scheduling for worker threads) ---- */
+typedef struct { unsigned int key; int x, y; } RtTile;
+
+/* Interleave the low 16 bits of x (standard bit scatter, part1by1). */
+static unsigned int morton_expand(unsigned int x) {
+    x &= 0x0000ffffu;
+    x = (x ^ (x << 8)) & 0x00ff00ffu;
+    x = (x ^ (x << 4)) & 0x0f0f0f0fu;
+    x = (x ^ (x << 2)) & 0x33333333u;
+    x = (x ^ (x << 1)) & 0x55555555u;
+    return x;
+}
+
+static int rt_tile_order_cmp(const void *a, const void *b) {
+    const RtTile *ta = (const RtTile *)a, *tb = (const RtTile *)b;
+    return ta->key < tb->key ? -1 : (ta->key > tb->key ? 1 : 0);
+}
+
 static int render_native_hdr(const Scene *s, V3 *hdr, int width, int height,
                              int spp, int max_depth) {
     V3 fwd, right, up;
     float aspect, tanH;
     render_camera_basis(s, width, height, &fwd, &right, &up, &aspect, &tanH);
     if (spp < 1) spp = 1;
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            hdr[y * width + x] = trace_pixel_samples(
-                s, fwd, right, up, aspect, tanH, x, y, width, height,
-                spp, max_depth, NULL, NULL);
+    /* Workers pop 16x16 tiles from a Morton-ordered queue: adjacent tiles are
+     * spatially close, and dynamic scheduling load-balances for free. Pixels
+     * are independent (per-pixel seeds), so ordering cannot change output. */
+    const int tile_size = 16;
+    int tile_w = (width + tile_size - 1) / tile_size;
+    int tile_h = (height + tile_size - 1) / tile_size;
+    int tile_count = tile_w * tile_h;
+    RtTile *order = (RtTile *)malloc((size_t)tile_count * sizeof *order);
+    if (order) {
+        int n = 0;
+        for (int ty = 0; ty < tile_h; ty++) {
+            for (int tx = 0; tx < tile_w; tx++) {
+                order[n].key = morton_expand((unsigned)tx) |
+                               (morton_expand((unsigned)ty) << 1);
+                order[n].x = tx;
+                order[n].y = ty;
+                n++;
+            }
+        }
+        qsort(order, (size_t)tile_count, sizeof *order, rt_tile_order_cmp);
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int t = 0; t < tile_count; t++) {
+        int tx = order ? order[t].x : t % tile_w;
+        int ty = order ? order[t].y : t / tile_w;
+        int x0 = tx * tile_size;
+        int y0 = ty * tile_size;
+        int x1 = x0 + tile_size < width ? x0 + tile_size : width;
+        int y1 = y0 + tile_size < height ? y0 + tile_size : height;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                hdr[y * width + x] = trace_pixel_samples(
+                    s, fwd, right, up, aspect, tanH, x, y, width, height,
+                    spp, max_depth, NULL, NULL);
+            }
         }
     }
+    free(order);
     return 1;
 }
 
@@ -584,12 +635,6 @@ static int object_bounds(const Object *o, Bounds *b) {
     return 0;
 }
 
-static V3 bounds_centroid(const Object *o) {
-    Bounds b;
-    if (!object_bounds(o, &b)) return v3(0, 0, 0);
-    return vscale(vadd(b.min, b.max), 0.5f);
-}
-
 static int hit_triangle(V3 ro, V3 rd, V3 a, V3 b, V3 c, float tmax, Hit *hit) {
     V3 e1 = vsub(b, a), e2 = vsub(c, a);
     V3 p = vcross(rd, e2);
@@ -614,6 +659,21 @@ static int hit_mesh(const RtMesh *mesh, V3 ro, V3 rd, float tmax, Hit *hit) {
     if (!mesh || mesh->triangle_count < 1 || mesh->triangle_count > RT_MAX_MESH_TRIANGLES) return 0;
     int found = 0;
     float best = tmax;
+    if (mesh->node_count <= 0) {
+        /* No BVH built: brute-force scan (same closest-hit semantics). */
+        for (int i = 0; i < mesh->triangle_count; i++) {
+            const int *tri = mesh->triangles[i];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+                tri[0] >= mesh->vertex_count || tri[1] >= mesh->vertex_count || tri[2] >= mesh->vertex_count) continue;
+            Hit candidate;
+            if (hit_triangle(ro, rd, mesh->vertices[tri[0]], mesh->vertices[tri[1]], mesh->vertices[tri[2]], best, &candidate)) {
+                best = candidate.t;
+                *hit = candidate;
+                found = 1;
+            }
+        }
+        return found;
+    }
     int stack[64]; int sp = 0;
     if (mesh->node_count > 0) stack[sp++] = 0;
     while (sp > 0) {
@@ -660,44 +720,109 @@ static int bounds_hit(Bounds b, V3 ro, V3 rd, float tmax) {
     return hi >= 0.0f && lo <= tmax;
 }
 
-static int centroid_axis(Bounds b) {
-    V3 e = vsub(b.max, b.min);
-    return e.x > e.y && e.x > e.z ? 0 : (e.y > e.z ? 1 : 2);
+static float bounds_area(Bounds b) {
+    float ex = ffmaxf_(b.max.x - b.min.x, 0.0f);
+    float ey = ffmaxf_(b.max.y - b.min.y, 0.0f);
+    float ez = ffmaxf_(b.max.z - b.min.z, 0.0f);
+    return 2.0f * (ex * ey + ey * ez + ez * ex);
 }
 
-static float centroid_component(V3 c, int axis) {
-    return axis == 0 ? c.x : (axis == 1 ? c.y : c.z);
-}
-
-static int build_accel_node(Scene *s, int start, int count) {
+/* Binned SAH node: bins object centroids along the widest centroid axis and
+ * splits at the minimum surface-area-heuristic cost, falling back to a leaf
+ * when no split pays for its own traversal. */
+static int build_accel_node(Scene *s, int start, int count, int depth) {
     int node_id = s->accel_node_count++;
     RtAccelNode *node = &s->accel_nodes[node_id];
-    Bounds all = bounds_empty();
+    Bounds all = bounds_empty(), centroid_bounds = bounds_empty();
     for (int i = start; i < start + count; i++) {
         Bounds b;
-        if (object_bounds(&s->objects[s->accel_indices[i]], &b)) all = bounds_union(all, b);
+        if (!object_bounds(&s->objects[s->accel_indices[i]], &b)) continue;
+        all = bounds_union(all, b);
+        Bounds cb = { vscale(vadd(b.min, b.max), 0.5f), vscale(vadd(b.min, b.max), 0.5f) };
+        centroid_bounds = bounds_union(centroid_bounds, cb);
     }
     node->min = all.min; node->max = all.max;
     node->left = node->right = -1; node->start = start; node->count = count;
-    if (count <= 4) return node_id;
+    if (count <= 2) return node_id;
+    if (depth >= RT_SAH_MAX_DEPTH ||
+        s->accel_node_count + 2 > (int)(sizeof s->accel_nodes / sizeof s->accel_nodes[0]))
+        return node_id;
 
-    int axis = centroid_axis(all);
-    for (int i = start + 1; i < start + count; i++) {
-        int key = s->accel_indices[i];
-        float key_value = centroid_component(bounds_centroid(&s->objects[key]), axis);
-        int j = i - 1;
-        while (j >= start) {
-            int other = s->accel_indices[j];
-            float other_value = centroid_component(bounds_centroid(&s->objects[other]), axis);
-            if (other_value <= key_value) break;
-            s->accel_indices[j + 1] = other;
+    float ex = centroid_bounds.max.x - centroid_bounds.min.x;
+    float ey = centroid_bounds.max.y - centroid_bounds.min.y;
+    float ez = centroid_bounds.max.z - centroid_bounds.min.z;
+    int axis = ex > ey && ex > ez ? 0 : (ey > ez ? 1 : 2);
+    float cmin = axis == 0 ? centroid_bounds.min.x
+               : axis == 1 ? centroid_bounds.min.y : centroid_bounds.min.z;
+    float extent = axis == 0 ? ex : (axis == 1 ? ey : ez);
+    float node_area = bounds_area(all);
+    if (extent <= 1e-6f || node_area <= 0.0f) return node_id;
+
+    Bounds bin_bounds[RT_SAH_BINS];
+    int bin_count[RT_SAH_BINS];
+    for (int b = 0; b < RT_SAH_BINS; b++) { bin_bounds[b] = bounds_empty(); bin_count[b] = 0; }
+    for (int i = start; i < start + count; i++) {
+        Bounds b;
+        if (!object_bounds(&s->objects[s->accel_indices[i]], &b)) continue;
+        V3 c = vscale(vadd(b.min, b.max), 0.5f);
+        float t = axis == 0 ? c.x : (axis == 1 ? c.y : c.z);
+        int bin = (int)(((t - cmin) / extent) * (float)RT_SAH_BINS);
+        if (bin < 0) bin = 0;
+        if (bin >= RT_SAH_BINS) bin = RT_SAH_BINS - 1;
+        bin_bounds[bin] = bounds_union(bin_bounds[bin], b);
+        bin_count[bin]++;
+    }
+
+    /* Suffix sweep (bins b..BINS-1), then prefix sweep picking the cheapest split. */
+    Bounds suf_bounds[RT_SAH_BINS];
+    int suf_count[RT_SAH_BINS];
+    Bounds acc_b = bounds_empty();
+    int acc_c = 0;
+    for (int b = RT_SAH_BINS - 1; b >= 0; b--) {
+        acc_b = bounds_union(acc_b, bin_bounds[b]);
+        acc_c += bin_count[b];
+        suf_bounds[b] = acc_b;
+        suf_count[b] = acc_c;
+    }
+    acc_b = bounds_empty();
+    acc_c = 0;
+    float best_cost = RT_SAH_PRIM_COST * (float)count;
+    int best_split = -1;
+    for (int b = 0; b < RT_SAH_BINS - 1; b++) {
+        acc_b = bounds_union(acc_b, bin_bounds[b]);
+        acc_c += bin_count[b];
+        if (acc_c == 0) continue;
+        if (suf_count[b + 1] == 0) break;
+        float cost = RT_SAH_TRAV_COST + RT_SAH_PRIM_COST *
+            ((float)acc_c * bounds_area(acc_b) +
+             (float)suf_count[b + 1] * bounds_area(suf_bounds[b + 1])) / node_area;
+        if (cost < best_cost) { best_cost = cost; best_split = b; }
+    }
+    if (best_split < 0) return node_id;
+
+    /* In-place partition: centroids in bins <= best_split go left. */
+    int i = start, j = start + count - 1;
+    while (i <= j) {
+        int id = s->accel_indices[i];
+        Bounds b;
+        if (!object_bounds(&s->objects[id], &b)) { i++; continue; }
+        V3 c = vscale(vadd(b.min, b.max), 0.5f);
+        float t = axis == 0 ? c.x : (axis == 1 ? c.y : c.z);
+        int bin = (int)(((t - cmin) / extent) * (float)RT_SAH_BINS);
+        if (bin < 0) bin = 0;
+        if (bin >= RT_SAH_BINS) bin = RT_SAH_BINS - 1;
+        if (bin <= best_split) {
+            i++;
+        } else {
+            s->accel_indices[i] = s->accel_indices[j];
+            s->accel_indices[j] = id;
             j--;
         }
-        s->accel_indices[j + 1] = key;
     }
-    int left_count = count / 2;
-    node->left = build_accel_node(s, start, left_count);
-    node->right = build_accel_node(s, start + left_count, count - left_count);
+    int left_count = i - start;
+    if (left_count == 0 || left_count == count) return node_id;
+    node->left = build_accel_node(s, start, left_count, depth + 1);
+    node->right = build_accel_node(s, start + left_count, count - left_count, depth + 1);
     node->count = 0;
     return node_id;
 }
@@ -710,7 +835,7 @@ void rt_build_accel(Scene *s) {
         Bounds b;
         if (object_bounds(&s->objects[i], &b)) s->accel_indices[s->accel_count++] = i;
     }
-    if (s->accel_count > 0) build_accel_node(s, 0, s->accel_count);
+    if (s->accel_count > 0) build_accel_node(s, 0, s->accel_count, 0);
 }
 
 /* ---- box (slab method; rays starting inside return the exit hit) ---- */

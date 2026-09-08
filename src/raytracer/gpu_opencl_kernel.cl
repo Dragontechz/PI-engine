@@ -282,7 +282,8 @@ int grid_traverse(const float3 ro, const float3 rd, const float max_t,
     float best_t = fmin(max_t, t_exit);
     int best_tri = -1;
     for (;;) {
-        uint ci = (uint)(cell_i.x * dims.y * dims.z + cell_i.y * dims.z + cell_i.z);
+        /* z-major, matching the host CSR builder (z*gy*gx + y*gx + x) */
+        uint ci = (uint)(cell_i.z * dims.y * dims.x + cell_i.y * dims.x + cell_i.x);
         uint off = grid_off[ci], end = grid_off[ci + 1u];
         for (; off < end; off++) {
             int tri = (int)grid_tri[off];
