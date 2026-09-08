@@ -12,6 +12,12 @@
 #define PI_F 3.14159265f
 #define EPS 1e-5f
 #define MAX_DEPTH 4
+#define INDIRECT_CLAMP 20.0f
+#define RADIANCE_CLAMP 4.0f
+/* Mirror of the CPU temporal-denoiser guards in tracer.c
+ * (instructions/optimisedenoiser.txt solutions 1/3/5). */
+#define FIREFLY_REL_K 4.0f
+#define FIREFLY_ABS_TOL 0.5f
 
 /* Per-frame scalar block (see OCL_FRAME_* in gpu_opencl.c). Every value the
  * trace kernels need that changes per frame travels through one buffer, so
@@ -644,6 +650,9 @@ float3 path_pixel(const int x, const int y, const int W, const int H,
             float no_l = fmax(dot(h.n, next_dir), 0.0f);
             if (no_l <= 0.0f) break;
             throughput *= f * (no_l / bsdf_pdf);
+            /* Keep rare indirect paths finite without clamping direct light. */
+            throughput = clamp(throughput, (float3)(0.0f),
+                               (float3)(INDIRECT_CLAMP));
             if (depth >= 2) {
                 float q = clamp01(fmax(lum(throughput),
                     fmax(throughput.x, fmax(throughput.y, throughput.z))));
@@ -654,7 +663,11 @@ float3 path_pixel(const int x, const int y, const int W, const int H,
             rd = next_dir;
         }
     }
-    return result / (float)sample_count;
+     result /= (float)sample_count;
+     if (!isfinite(result.x) || !isfinite(result.y) || !isfinite(result.z))
+         result = (float3)(0.0f);
+     result = clamp(result, (float3)(0.0f), (float3)(RADIANCE_CLAMP));
+     return result;
 }
 
 __kernel void rt_main(__global float4 *out, __global const float *frame,
@@ -714,11 +727,55 @@ __kernel void rt_main(__global float4 *out, __global const float *frame,
          const float old_count = (float)sample_base;
          const float new_count = old_count + (float)(spp < 1 ? 1 : spp);
          float3 old = out[o].xyz;
+         if (old_count > 0.0f) {
+             /* History clamp before the blend so one firefly sample can
+              * not corrupt clean history on static-camera frames. */
+             float hl = lum(old);
+             float cl = lum(result);
+             float allowed = hl * FIREFLY_REL_K + FIREFLY_ABS_TOL;
+             if (cl > allowed && cl > 1e-6f) result *= allowed / cl;
+         }
          result = old_count > 0.0f
              ? (old * old_count + result * (float)spp) / new_count
              : result;
      }
      out[o] = (float4)(result, 1.0f);
+}
+
+/* Cold-start firefly filter. This is deliberately a separate pass and only
+ * launched for the first accumulation frame after a camera reset. It keeps
+ * clean detail intact and replaces only isolated bright samples with the
+ * local 3x3 neighbourhood mean, matching the CPU fallback. */
+__kernel void rt_coldstart(__global const float4 *src, __global float4 *dst,
+                           __global const float *frame) {
+    const int W = (int)frame[F_W], H = (int)frame[F_H];
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= W || y >= H) return;
+    const float3 center = src[y * W + x].xyz;
+    const float center_l = lum(center);
+    float3 sum = (float3)(0.0f);
+    for (int oy = -1; oy <= 1; oy++) {
+        const int ny = clamp(y + oy, 0, H - 1);
+        for (int ox = -1; ox <= 1; ox++) {
+            if (ox == 0 && oy == 0) continue;
+            const int nx = clamp(x + ox, 0, W - 1);
+            sum += src[ny * W + nx].xyz;
+        }
+    }
+    const float3 mean = sum * (1.0f / 8.0f);
+    const float allowed = lum(mean) * FIREFLY_REL_K + FIREFLY_ABS_TOL;
+    dst[y * W + x] = center_l > allowed
+        ? (float4)(mean, 1.0f) : src[y * W + x];
+}
+
+__kernel void rt_copy_hdr(__global const float4 *src, __global float4 *dst,
+                          __global const float *frame) {
+    const int W = (int)frame[F_W], H = (int)frame[F_H];
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= W || y >= H) return;
+    dst[y * W + x] = src[y * W + x];
 }
 
 /* Hybrid tile worker: one workgroup per tile (tile*tile work-items),

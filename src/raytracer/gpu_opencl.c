@@ -140,7 +140,8 @@ struct OclRenderer {
     struct OclApi api;
     clh device;                 /* cl_device_id for kernel workgroup queries */
     clh ctx, queue, prog, kernel;
-    clh k_logavg, k_post, k_upscale, k_cas, k_tiles, k_present;
+    clh k_logavg, k_post, k_upscale, k_cas, k_coldstart, k_copy_hdr;
+    clh k_tiles, k_present;
     clh d_out;
     clh d_gl;                   /* GL-shared presentation image (interop) */
     clh d_tilebuf;
@@ -151,7 +152,7 @@ struct OclRenderer {
     clh d_lpos, d_lcol, d_lrad, d_tris;
     clh d_grid_a, d_grid_dims, d_grid_off, d_grid_tri;
     const Scene *uploaded_scene; /* static geometry uploaded for this scene */
-    clh d_rgb_in, d_present, d_cas, d_logpart;
+    clh d_rgb_in, d_present, d_cas, d_coldstart, d_logpart;
     clh d_frame;
     int tile_size;              /* rt_tiles workgroup tile (8 or 16), 0 = unset */
     float h_grid_a[4];          /* origin.xyz, cell size */
@@ -213,15 +214,17 @@ static void release_all(struct OclRenderer *g) {
                         &g->d_cyl_texA, &g->d_cyl_texB,
                         &g->d_plane_pos, &g->d_plane_mat, &g->d_plane_emi,
                         &g->d_plane_texA, &g->d_plane_texB,
-                        &g->d_lpos, &g->d_lcol, &g->d_lrad, &g->d_tris,
+                         &g->d_lpos, &g->d_lcol, &g->d_lrad, &g->d_tris,
                         &g->d_grid_a, &g->d_grid_dims, &g->d_grid_off, &g->d_grid_tri,
-                        &g->d_rgb_in, &g->d_present, &g->d_cas, &g->d_logpart,
+                         &g->d_rgb_in, &g->d_present, &g->d_cas, &g->d_coldstart,
+                         &g->d_logpart,
                          &g->d_tilebuf, &g->d_gl, &g->d_frame };
         for (size_t i = 0; i < sizeof mems / sizeof mems[0]; i++) {
             if (*mems[i]) g->api.ReleaseMemObject(*mems[i]);
         }
     }
     clh *kerns[] = { &g->kernel, &g->k_logavg, &g->k_post, &g->k_upscale, &g->k_cas,
+                     &g->k_coldstart, &g->k_copy_hdr,
                      &g->k_tiles, &g->k_present };
     for (size_t i = 0; i < sizeof kerns / sizeof kerns[0]; i++) {
         if (*kerns[i] && g->api.ReleaseKernel) g->api.ReleaseKernel(*kerns[i]);
@@ -351,6 +354,7 @@ OclRenderer *Ocl_Create(int width, int height) {
     struct { const char *name; clh *dst; } kernels[] = {
         { "rt_logavg", &g->k_logavg }, { "rt_post", &g->k_post },
         { "rt_upscale", &g->k_upscale }, { "rt_cas", &g->k_cas },
+        { "rt_coldstart", &g->k_coldstart }, { "rt_copy_hdr", &g->k_copy_hdr },
         { "rt_tiles", &g->k_tiles },
     };
     for (size_t i = 0; i < sizeof kernels / sizeof kernels[0]; i++) {
@@ -395,6 +399,7 @@ OclRenderer *Ocl_Create(int width, int height) {
     g->d_rgb_in = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 4);
     g->d_present = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 4);
     g->d_cas = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 4);
+    g->d_coldstart = make_buffer(g, CL_MEM_READ_WRITE, (size_t)OCL_MAX_W * OCL_MAX_H * 16);
     g->d_logpart = make_buffer(g, CL_MEM_READ_WRITE, OCL_LOG_GROUPS * 4);
     g->d_frame = make_buffer(g, CL_MEM_READ_ONLY, FRAME_FLOATS * 4);
     g->d_tilebuf = make_buffer(g, CL_MEM_READ_ONLY, (size_t)OCL_MAX_TILES * 2 * sizeof(cl_int));
@@ -406,7 +411,7 @@ OclRenderer *Ocl_Create(int width, int height) {
         || !g->d_plane_texA || !g->d_plane_texB || !g->d_lpos || !g->d_lcol
         || !g->d_lrad || !g->d_grid_a || !g->d_grid_dims || !g->d_grid_off
         || !g->d_grid_tri || !g->d_rgb_in || !g->d_present || !g->d_cas
-        || !g->d_logpart || !g->d_tilebuf || !g->d_frame) {
+        || !g->d_coldstart || !g->d_logpart || !g->d_tilebuf || !g->d_frame) {
         fprintf(stderr, "OpenCL: buffer allocation failed\n");
         release_all(g); free(g); return NULL;
     }
@@ -453,6 +458,16 @@ OclRenderer *Ocl_Create(int width, int height) {
                 fprintf(stderr, "OpenCL: kernel arg binding failed\n");
                 release_all(g); free(g); return NULL;
             }
+        }
+        int ok = api->SetKernelArg(g->k_coldstart, 0, sizeof(clh), &g->d_out) == CL_SUCCESS;
+        ok &= api->SetKernelArg(g->k_coldstart, 1, sizeof(clh), &g->d_coldstart) == CL_SUCCESS;
+        ok &= api->SetKernelArg(g->k_coldstart, 2, sizeof(clh), &g->d_frame) == CL_SUCCESS;
+        ok &= api->SetKernelArg(g->k_copy_hdr, 0, sizeof(clh), &g->d_coldstart) == CL_SUCCESS;
+        ok &= api->SetKernelArg(g->k_copy_hdr, 1, sizeof(clh), &g->d_out) == CL_SUCCESS;
+        ok &= api->SetKernelArg(g->k_copy_hdr, 2, sizeof(clh), &g->d_frame) == CL_SUCCESS;
+        if (!ok) {
+            fprintf(stderr, "OpenCL: denoiser kernel arg binding failed\n");
+            release_all(g); free(g); return NULL;
         }
     }
     fprintf(stderr, "OpenCL: renderer ready\n");
@@ -956,6 +971,21 @@ static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rg
     if (!enq_ok || !fin_ok) {
         g->broken = 1;
         return 0;
+    }
+    if (accumulate && sample_base == 0) {
+        /* Camera moves reset history. Filter only this cold-start frame so
+         * isolated fireflies do not dominate the first temporal samples;
+         * steady-state frames pay no denoiser cost. */
+        clh k_f = g->k_coldstart, k_copy = g->k_copy_hdr;
+        int cold_ok = api->EnqueueNDRangeKernel(g->queue, k_f, 2, NULL,
+                                                global, local, 0, NULL, NULL) == CL_SUCCESS;
+        cold_ok = cold_ok && api->EnqueueNDRangeKernel(g->queue, k_copy, 2, NULL,
+                                                       global, local, 0, NULL, NULL) == CL_SUCCESS;
+        cold_ok = cold_ok && api->Finish(g->queue) == CL_SUCCESS;
+        if (!cold_ok) {
+            g->broken = 1;
+            return 0;
+        }
     }
     /* GPU post chain: log-avg reduction -> host exposure math (shared
      * adaptation state) -> bloom/Reinhard/sRGB kernel -> optional upscale+CAS.

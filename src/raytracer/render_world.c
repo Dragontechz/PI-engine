@@ -58,7 +58,9 @@ int main(int argc, char **argv) {
         else if (i == 3) H = atoi(argv[i]);
     }
 
-    Scene scene;
+    /* Scene contains large fixed-size mesh/BVH arrays and must not live on the
+     * small Windows thread stack. */
+    static Scene scene;
     if (strcmp(which, "block") == 0) scene_block(&scene);
     else scene_world(&scene);
 

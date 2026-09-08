@@ -45,6 +45,21 @@ static float texture_hash(int x, int y, int z) {
 #define RT_LUMINANCE_TO_CD_M2 100.0f
 #define RT_EXPOSURE_KEY 0.18f
 #define RT_PUPIL_REFERENCE_MM 4.0f
+#define RT_INDIRECT_CLAMP 20.0f
+#define RT_RADIANCE_CLAMP 4.0f
+/* Temporal-denoiser firefly guards (instructions/optimisedenoiser.txt).
+ * The progressive accumulator hard-resets on camera moves (no motion
+ * vectors in this tracer), so cold-start frames begin at 1-2 spp and a
+ * single clamped spike (up to RADIANCE_CLAMP) would dominate for many
+ * frames. The two guards below address that without any motion data:
+ *  - history-relative clamp on every accumulated frame (solutions 1/3/5):
+ *    an incoming sample far brighter than its history is scaled back,
+ *    preserving chroma. Absolute tolerance keeps emissive/sun detail.
+ *  - conditional 3x3 cold-start filter on sample_base == 0 (solution 4):
+ *    isolated spikes are replaced by their neighbourhood mean; clean
+ *    pixels stay untouched so detail survives frame 1. */
+#define RT_FIREFLY_REL_K 4.0f
+#define RT_FIREFLY_ABS_TOL 0.5f
 
 static float rt_frame_delta = 1.0f / 45.0f;
 static float rt_adapted_luminance = -1.0f;
@@ -58,6 +73,55 @@ static void render_camera_basis(const Scene *s, int width, int height,
 static V3 camera_ray(V3 fwd, V3 right, V3 up, float aspect, float tanH,
                      int x, int y, int width, int height);
 static int postprocess_hdr(const V3 *hdr, unsigned char *rgb, int width, int height);
+static float luminance(V3 c);
+
+/* Scale an incoming accumulation sample back when its luminance spikes far
+ * above the pixel history. Uniform scale preserves chroma; legitimate bright
+ * surfaces (sun disk, emissive balls) survive via the absolute tolerance. */
+static V3 clamp_sample_to_history(V3 c, V3 h) {
+    float hl = luminance(h);
+    float cl = luminance(c);
+    float allowed = hl * RT_FIREFLY_REL_K + RT_FIREFLY_ABS_TOL;
+    if (cl > allowed && cl > 1e-6f) {
+        c = vscale(c, allowed / cl);
+    }
+    return c;
+}
+
+/* Cold-start firefly filter: replace isolated spikes with their 8-neighbour
+ * mean. Runs once per camera reset (sample_base == 0), so its cost never
+ * affects steady-state accumulation and the temporal mean re-sharpens any
+ * touched pixel within a few frames. Reads from a snapshot so the result is
+ * independent of OpenMP thread order. */
+static void coldstart_firefly_filter(V3 *hdr, int width, int height) {
+    V3 *src = (V3 *)malloc((size_t)width * height * sizeof *src);
+    if (!src) return;
+    memcpy(src, hdr, (size_t)width * height * sizeof *src);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            V3 center = src[y * width + x];
+            float cl = luminance(center);
+            V3 sum = v3(0, 0, 0);
+            for (int oy = -1; oy <= 1; oy++) {
+                int ny = y + oy < 0 ? 0 : (y + oy >= height ? height - 1 : y + oy);
+                for (int ox = -1; ox <= 1; ox++) {
+                    if (!ox && !oy) continue;
+                    int nx = x + ox < 0 ? 0 : (x + ox >= width ? width - 1 : x + ox);
+                    sum = vadd(sum, src[ny * width + nx]);
+                }
+            }
+            V3 mean = vscale(sum, 1.0f / 8.0f);
+            float ml = luminance(mean);
+            if (cl > ml * RT_FIREFLY_REL_K + RT_FIREFLY_ABS_TOL) {
+                hdr[y * width + x] = mean;
+            }
+        }
+    }
+    free(src);
+}
 
 void rt_set_frame_delta(float delta_seconds) {
     if (delta_seconds > 0.0f && isfinite(delta_seconds)) {
@@ -330,6 +394,10 @@ static V3 path_radiance(const Scene *s, V3 ro, V3 rd, unsigned int *rng,
         float no_l = ffmaxf_(vdot(n, next), 0.0f);
         if (bsdf_pdf <= 1e-6f || no_l <= 0.0f) break;
         throughput = vscale(vmul(throughput, f), no_l / bsdf_pdf);
+        /* Bound rare indirect paths without changing direct-light estimates. */
+        throughput.x = ffminf_(ffmaxf_(throughput.x, 0.0f), RT_INDIRECT_CLAMP);
+        throughput.y = ffminf_(ffmaxf_(throughput.y, 0.0f), RT_INDIRECT_CLAMP);
+        throughput.z = ffminf_(ffmaxf_(throughput.z, 0.0f), RT_INDIRECT_CLAMP);
         if (depth >= 2) {
             float q = clamp01(ffmaxf_(luminance(throughput), ffmaxf_(throughput.x, ffmaxf_(throughput.y, throughput.z))));
             if (rng_float(rng) > q) break;
@@ -338,6 +406,11 @@ static V3 path_radiance(const Scene *s, V3 ro, V3 rd, unsigned int *rng,
         ro = vadd(p, vscale(n, 1e-3f));
         rd = next;
     }
+    if (!isfinite(result.x) || !isfinite(result.y) || !isfinite(result.z))
+        return v3(0, 0, 0);
+    result.x = ffminf_(ffmaxf_(result.x, 0.0f), RT_RADIANCE_CLAMP);
+    result.y = ffminf_(ffmaxf_(result.y, 0.0f), RT_RADIANCE_CLAMP);
+    result.z = ffminf_(ffmaxf_(result.z, 0.0f), RT_RADIANCE_CLAMP);
     return result;
 }
 
@@ -367,7 +440,10 @@ static V3 trace_pixel_samples(const Scene *s, V3 fwd, V3 right, V3 up,
     float inv = 1.0f / (float)samples;
     if (mean_luminance) *mean_luminance = luminance_sum * inv;
     if (primary_object) *primary_object = object;
-    return vscale(sum, inv);
+    V3 result = vscale(sum, inv);
+    if (!isfinite(result.x) || !isfinite(result.y) || !isfinite(result.z))
+        return v3(0, 0, 0);
+    return result;
 }
 
 /* ---- Morton-order 16x16 tile queue (tile scheduling for worker threads) ---- */
@@ -614,14 +690,25 @@ int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
                                             x, y, width, height, spp, sample_base,
                                             max_depth, NULL, NULL);
                 int n = sample_base + spp;
-                hdr[y * width + x] = sample_base > 0
-                    ? vscale(vadd(vscale(hdr[y * width + x], (float)sample_base),
-                                  vscale(c, (float)spp)), 1.0f / (float)n)
-                    : c;
+                if (sample_base > 0) {
+                    /* History clamp before the blend: a single firefly must
+                     * not corrupt clean history on static-camera frames. */
+                    c = clamp_sample_to_history(c, hdr[y * width + x]);
+                    hdr[y * width + x] =
+                        vscale(vadd(vscale(hdr[y * width + x], (float)sample_base),
+                                  vscale(c, (float)spp)), 1.0f / (float)n);
+                } else {
+                    hdr[y * width + x] = c;
+                }
             }
         }
     }
     free(tiles_xy);
+    if (sample_base == 0) {
+        /* First frame after a camera reset: kill isolated spikes now so the
+         * temporal mean starts from a sane value (solution 4). */
+        coldstart_firefly_filter(hdr, width, height);
+    }
     return 1;
 }
 
@@ -1375,6 +1462,10 @@ static int postprocess_hdr(const V3 *hdr, unsigned char *rgb, int width, int hei
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             V3 c = exposed_hdr(hdr, width, height, x, y, exposure);
+            if (!isfinite(c.x) || !isfinite(c.y) || !isfinite(c.z)) c = v3(0, 0, 0);
+            c.x = ffmaxf_(c.x, 0.0f);
+            c.y = ffmaxf_(c.y, 0.0f);
+            c.z = ffmaxf_(c.z, 0.0f);
             c = v3(c.x / (1.0f + c.x), c.y / (1.0f + c.y), c.z / (1.0f + c.z));
             int i = (y * width + x) * 3;
             rgb[i + 0] = linear_to_srgb(c.x);
