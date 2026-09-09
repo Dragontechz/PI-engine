@@ -27,7 +27,7 @@ $simd = @('-march=native', '-mtune=native', '-mprefer-vector-width=128')
 $inc = @('-I', (Join-Path $raylib 'include'), '-I', (Join-Path $root 'src/raytracer'))
 
 $objs = @()
-foreach ($f in @('world_viewer', 'tracer', 'tracer_scene', 'pitsr', 'hybrid')) {
+foreach ($f in @('world_viewer', 'tracer', 'tracer_scene', 'pitsr', 'hybrid', 'gbuffer')) {
     $obj = Join-Path $build "$f.o"
     gcc @base @simd -c (Join-Path $root "src/raytracer/$f.c") -o $obj @inc
     if (-not $?) { throw "Failed to compile $f" }

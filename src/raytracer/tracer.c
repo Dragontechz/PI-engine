@@ -61,7 +61,6 @@ static float texture_hash(int x, int y, int z) {
 #define RT_FIREFLY_REL_K 4.0f
 #define RT_FIREFLY_ABS_TOL 0.5f
 #define RT_INPUT_LUMINANCE_CLAMP 10.0f
-#define RT_SOFT_RESET_HISTORY 0.20f
 
 static float rt_frame_delta = 1.0f / 45.0f;
 static float rt_adapted_luminance = -1.0f;
@@ -717,12 +716,7 @@ int rt_render_progressive_hdr_reset(const Scene *s, V3 *hdr, int width, int heig
                                             max_depth, NULL, NULL);
                 int n = render_base + spp;
                 c = clamp_sample_input(c);
-                if (soft_reset) {
-                    V3 previous = hdr[y * width + x];
-                    hdr[y * width + x] = vadd(
-                        vscale(previous, RT_SOFT_RESET_HISTORY),
-                        vscale(c, 1.0f - RT_SOFT_RESET_HISTORY));
-                } else if (render_base > 0) {
+                if (render_base > 0) {
                     /* History clamp before the blend: a single firefly must
                      * not corrupt clean history on static-camera frames. */
                     c = clamp_sample_to_history(c, hdr[y * width + x]);

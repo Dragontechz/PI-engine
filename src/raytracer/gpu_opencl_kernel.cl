@@ -19,7 +19,6 @@
 #define FIREFLY_REL_K 4.0f
 #define FIREFLY_ABS_TOL 0.5f
 #define INPUT_LUMINANCE_CLAMP 10.0f
-#define SOFT_RESET_HISTORY 0.20f
 
 /* Per-frame scalar block (see OCL_FRAME_* in gpu_opencl.c). Every value the
  * trace kernels need that changes per frame travels through one buffer, so
@@ -734,12 +733,8 @@ __kernel void rt_main(__global float4 *out, __global const float *frame,
          const float input_l = lum(result);
          if (input_l > INPUT_LUMINANCE_CLAMP && input_l > 1e-6f)
              result *= INPUT_LUMINANCE_CLAMP / input_l;
-         if (soft_reset) {
-             /* Preserve 20% of the previous display history during a camera
-              * move, rather than exposing an unfiltered one-sample reset. */
-             result = old * SOFT_RESET_HISTORY + result * (1.0f - SOFT_RESET_HISTORY);
-          } else {
-              if (old_count > 0.0f) {
+          {
+               if (old_count > 0.0f) {
                   /* History clamp before the blend so one firefly sample can
                    * not corrupt clean history on static-camera frames. */
                   float hl = lum(old);
