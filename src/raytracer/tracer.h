@@ -138,6 +138,12 @@ int rt_render_native(const Scene *scene, unsigned char *rgb, int width, int heig
 /* Add deterministic samples [sample_base, sample_base+spp) into hdr. */
 int rt_render_progressive_hdr(const Scene *scene, V3 *hdr, int width, int height,
                               int spp, int sample_base, int max_depth);
+/* Progressive render with an optional camera-change soft reset. A soft reset
+ * keeps a small amount of the previous display history instead of discarding
+ * it completely; pass sample_base from the previous accumulation count. */
+int rt_render_progressive_hdr_reset(const Scene *scene, V3 *hdr, int width, int height,
+                                    int spp, int sample_base, int max_depth,
+                                    int soft_reset);
 /* Trace only the listed tile origins (tx, ty pairs, tile size 16) into an
  * HDR film of width x height pixels; worker threads pop tiles dynamically. */
 int rt_render_tiles_hdr(const Scene *scene, V3 *hdr, int width, int height,

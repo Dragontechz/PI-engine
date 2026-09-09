@@ -39,6 +39,7 @@
 #define F_BMAT 44
 #define F_BEMI 48
 #define F_ACCUM 30
+#define F_SOFT_RESET 31
 #define FRAME_FLOATS 52
 #define OCL_GRID_TRI_CAP (OCL_MAX_TRIS * 8)  /* max CSR triangle refs */
 #define OCL_LOG_GROUPS 256   /* rt_logavg partial sums */
@@ -164,6 +165,8 @@ struct OclRenderer {
     int tri_count;
     int frames;
     int accum_samples;
+    int accum_valid;
+    int soft_reset;
     int broken;
 };
 
@@ -644,7 +647,7 @@ struct OclSceneInfo { int ns, nb, nc, npl, nl; int nargs; };
 static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
                             int film_w, int film_h, float aspect, int spp,
                             int sample_base, int accumulating,
-                            struct OclSceneInfo *info) {
+                            int soft_reset, struct OclSceneInfo *info) {
     (void)kernel; /* args bound once in Ocl_Create */
     if (!upload_triangles(g, s)) { g->broken = 1; return 0; }
 
@@ -869,6 +872,7 @@ static int ocl_upload_scene(OclRenderer *g, const Scene *s, clh kernel,
     frame[F_SPP] = (float)spp;
     frame[F_SAMPLE_BASE] = (float)sample_base;
     frame[F_ACCUM] = (float)accumulating;
+    frame[F_SOFT_RESET] = (float)soft_reset;
     frame[F_COUNTS] = (float)ns;
     frame[F_COUNTS + 1] = (float)nb;
     frame[F_COUNTS + 2] = (float)nc;
@@ -928,7 +932,11 @@ static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rg
     if (internal_w <= 0 || internal_h <= 0) { internal_w = width; internal_h = height; }
     if (internal_w > OCL_MAX_W || internal_h > OCL_MAX_H) return 0;
     if (spp < 1) spp = 1;
-    if (!accumulate) g->accum_samples = 0;
+    if (!accumulate) {
+        g->accum_samples = 0;
+        g->accum_valid = 0;
+        g->soft_reset = 0;
+    }
     if (cas < 0.0f) cas = 0.0f;
     if (cas > 1.0f) cas = 1.0f;
     const int upscaling = internal_w != width || internal_h != height;
@@ -937,10 +945,12 @@ static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rg
     struct OclSceneInfo info;
     /* ray generation uses the presentation aspect, exactly like before */
     const int sample_base = accumulate ? g->accum_samples : 0;
+    const int soft_reset = accumulate && g->soft_reset && g->accum_valid;
     if (!ocl_upload_scene(g, s, g->kernel, internal_w, internal_h,
                           (float)width / (float)height, spp,
-                          sample_base, accumulate, &info)) return 0;
-    if (accumulate && sample_base == 0) {
+                          soft_reset ? 0 : sample_base, accumulate,
+                          soft_reset, &info)) return 0;
+    if (accumulate && sample_base == 0 && !soft_reset) {
         static unsigned char *zeroes;
         static size_t zeroes_size;
         const size_t bytes = (size_t)internal_w * internal_h * 16;
@@ -972,7 +982,7 @@ static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rg
         g->broken = 1;
         return 0;
     }
-    if (accumulate && sample_base == 0) {
+    if (accumulate && (sample_base == 0 || soft_reset)) {
         /* Camera moves reset history. Filter only this cold-start frame so
          * isolated fireflies do not dominate the first temporal samples;
          * steady-state frames pay no denoiser cost. */
@@ -1126,7 +1136,11 @@ static int ocl_render_internal(OclRenderer *g, const Scene *s, unsigned char *rg
                 internal_w, internal_h);
         fflush(stderr);
     }
-    if (accumulate) g->accum_samples += spp;
+    if (accumulate) {
+        g->accum_samples = soft_reset ? spp : g->accum_samples + spp;
+        g->accum_valid = 1;
+        g->soft_reset = 0;
+    }
     return 1;
 }
 
@@ -1140,7 +1154,7 @@ int Ocl_Render(OclRenderer *g, const Scene *s, unsigned char *rgb,
 int Ocl_RenderAccum(OclRenderer *g, const Scene *s, unsigned char *rgb,
                     int width, int height, int internal_w, int internal_h,
                     int spp, float cas, int reset) {
-    if (reset) g->accum_samples = 0;
+    if (reset) g->soft_reset = g->accum_valid;
     return ocl_render_internal(g, s, rgb, width, height, internal_w, internal_h,
                                spp, cas, 1);
 }
@@ -1160,7 +1174,7 @@ int Ocl_TraceTiles(OclRenderer *g, const Scene *s, int width, int height,
     struct OclSceneInfo info;
     /* film aspect: matches the CPU ray generator pixel for pixel */
     if (!ocl_upload_scene(g, s, g->k_tiles, width, height,
-                          (float)width / (float)height, spp, 0, 0, &info)) return 0;
+                          (float)width / (float)height, spp, 0, 0, 0, &info)) return 0;
     struct OclApi *api = &g->api;
 
     if (api->EnqueueWriteBuffer(g->queue, g->d_tilebuf, CL_FALSE, 0,

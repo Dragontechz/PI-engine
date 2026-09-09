@@ -60,6 +60,8 @@ static float texture_hash(int x, int y, int z) {
  *    pixels stay untouched so detail survives frame 1. */
 #define RT_FIREFLY_REL_K 4.0f
 #define RT_FIREFLY_ABS_TOL 0.5f
+#define RT_INPUT_LUMINANCE_CLAMP 10.0f
+#define RT_SOFT_RESET_HISTORY 0.20f
 
 static float rt_frame_delta = 1.0f / 45.0f;
 static float rt_adapted_luminance = -1.0f;
@@ -88,8 +90,15 @@ static V3 clamp_sample_to_history(V3 c, V3 h) {
     return c;
 }
 
-/* Cold-start firefly filter: replace isolated spikes with their 8-neighbour
- * mean. Runs once per camera reset (sample_base == 0), so its cost never
+static V3 clamp_sample_input(V3 c) {
+    float l = luminance(c);
+    if (l > RT_INPUT_LUMINANCE_CLAMP && l > 1e-6f)
+        c = vscale(c, RT_INPUT_LUMINANCE_CLAMP / l);
+    return c;
+}
+
+/* Cold-start firefly filter: replace isolated spikes with the 3x3 luminance
+ * median. Runs once per camera reset, so its cost never
  * affects steady-state accumulation and the temporal mean re-sharpens any
  * touched pixel within a few frames. Reads from a snapshot so the result is
  * independent of OpenMP thread order. */
@@ -104,20 +113,34 @@ static void coldstart_firefly_filter(V3 *hdr, int width, int height) {
         for (int x = 0; x < width; x++) {
             V3 center = src[y * width + x];
             float cl = luminance(center);
-            V3 sum = v3(0, 0, 0);
+            V3 values[9];
+            int count = 0;
+            values[count++] = center;
             for (int oy = -1; oy <= 1; oy++) {
                 int ny = y + oy < 0 ? 0 : (y + oy >= height ? height - 1 : y + oy);
                 for (int ox = -1; ox <= 1; ox++) {
                     if (!ox && !oy) continue;
                     int nx = x + ox < 0 ? 0 : (x + ox >= width ? width - 1 : x + ox);
-                    sum = vadd(sum, src[ny * width + nx]);
+                    values[count++] = src[ny * width + nx];
                 }
             }
-            V3 mean = vscale(sum, 1.0f / 8.0f);
-            float ml = luminance(mean);
-            if (cl > ml * RT_FIREFLY_REL_K + RT_FIREFLY_ABS_TOL) {
-                hdr[y * width + x] = mean;
+            /* A 3x3 median removes isolated hot/cold samples without the
+             * broad blur caused by averaging neighbourhoods. */
+            for (int i = 1; i < count; i++) {
+                V3 value = values[i];
+                float vl = luminance(value);
+                int j = i;
+                while (j > 0 && luminance(values[j - 1]) > vl) {
+                    values[j] = values[j - 1];
+                    j--;
+                }
+                values[j] = value;
             }
+            V3 median = values[count / 2];
+            float ml = luminance(median);
+            if (cl > ml * RT_FIREFLY_REL_K + RT_FIREFLY_ABS_TOL ||
+                cl > RT_INPUT_LUMINANCE_CLAMP)
+                hdr[y * width + x] = median;
         }
     }
     free(src);
@@ -662,8 +685,9 @@ int rt_render_native(const Scene *s, unsigned char *rgb, int width, int height,
     return ok;
 }
 
-int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
-                              int spp, int sample_base, int max_depth) {
+int rt_render_progressive_hdr_reset(const Scene *s, V3 *hdr, int width, int height,
+                                    int spp, int sample_base, int max_depth,
+                                    int soft_reset) {
     if (!s || !hdr || width <= 0 || height <= 0 || spp <= 0 || sample_base < 0)
         return 0;
     int tile_count = rt_build_tile_origins(width, height, RT_TILE, NULL, 0);
@@ -673,6 +697,7 @@ int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
         free(tiles_xy);
         return 0;
     }
+    const int render_base = soft_reset ? 0 : sample_base;
     V3 fwd, right, up;
     float aspect, tanH;
     render_camera_basis(s, width, height, &fwd, &right, &up, &aspect, &tanH);
@@ -687,15 +712,22 @@ int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
         for (int y = y0; y < y1; y++) {
             for (int x = x0; x < x1; x++) {
                 V3 c = trace_pixel_samples(s, fwd, right, up, aspect, tanH,
-                                            x, y, width, height, spp, sample_base,
+                                            x, y, width, height, spp,
+                                            soft_reset ? 0 : sample_base,
                                             max_depth, NULL, NULL);
-                int n = sample_base + spp;
-                if (sample_base > 0) {
+                int n = render_base + spp;
+                c = clamp_sample_input(c);
+                if (soft_reset) {
+                    V3 previous = hdr[y * width + x];
+                    hdr[y * width + x] = vadd(
+                        vscale(previous, RT_SOFT_RESET_HISTORY),
+                        vscale(c, 1.0f - RT_SOFT_RESET_HISTORY));
+                } else if (render_base > 0) {
                     /* History clamp before the blend: a single firefly must
                      * not corrupt clean history on static-camera frames. */
                     c = clamp_sample_to_history(c, hdr[y * width + x]);
                     hdr[y * width + x] =
-                        vscale(vadd(vscale(hdr[y * width + x], (float)sample_base),
+                        vscale(vadd(vscale(hdr[y * width + x], (float)render_base),
                                   vscale(c, (float)spp)), 1.0f / (float)n);
                 } else {
                     hdr[y * width + x] = c;
@@ -704,12 +736,18 @@ int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
         }
     }
     free(tiles_xy);
-    if (sample_base == 0) {
+    if (sample_base == 0 || soft_reset) {
         /* First frame after a camera reset: kill isolated spikes now so the
          * temporal mean starts from a sane value (solution 4). */
         coldstart_firefly_filter(hdr, width, height);
     }
     return 1;
+}
+
+int rt_render_progressive_hdr(const Scene *s, V3 *hdr, int width, int height,
+                              int spp, int sample_base, int max_depth) {
+    return rt_render_progressive_hdr_reset(s, hdr, width, height, spp,
+                                            sample_base, max_depth, 0);
 }
 
 int rt_postprocess_hdr(const V3 *hdr, unsigned char *rgb, int width, int height) {

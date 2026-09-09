@@ -18,6 +18,8 @@
  * (instructions/optimisedenoiser.txt solutions 1/3/5). */
 #define FIREFLY_REL_K 4.0f
 #define FIREFLY_ABS_TOL 0.5f
+#define INPUT_LUMINANCE_CLAMP 10.0f
+#define SOFT_RESET_HISTORY 0.20f
 
 /* Per-frame scalar block (see OCL_FRAME_* in gpu_opencl.c). Every value the
  * trace kernels need that changes per frame travels through one buffer, so
@@ -41,6 +43,7 @@
 #define F_BMAT 44
 #define F_BEMI 48
 #define F_ACCUM 30
+#define F_SOFT_RESET 31
 #define FRAME_FLOATS 52
 
 struct Hit { float t; float3 n; int kind; int idx; };
@@ -727,25 +730,35 @@ __kernel void rt_main(__global float4 *out, __global const float *frame,
          const float old_count = (float)sample_base;
          const float new_count = old_count + (float)(spp < 1 ? 1 : spp);
          float3 old = out[o].xyz;
-         if (old_count > 0.0f) {
-             /* History clamp before the blend so one firefly sample can
-              * not corrupt clean history on static-camera frames. */
-             float hl = lum(old);
-             float cl = lum(result);
-             float allowed = hl * FIREFLY_REL_K + FIREFLY_ABS_TOL;
-             if (cl > allowed && cl > 1e-6f) result *= allowed / cl;
-         }
-         result = old_count > 0.0f
-             ? (old * old_count + result * (float)spp) / new_count
-             : result;
-     }
+         const int soft_reset = (int)frame[F_SOFT_RESET];
+         const float input_l = lum(result);
+         if (input_l > INPUT_LUMINANCE_CLAMP && input_l > 1e-6f)
+             result *= INPUT_LUMINANCE_CLAMP / input_l;
+         if (soft_reset) {
+             /* Preserve 20% of the previous display history during a camera
+              * move, rather than exposing an unfiltered one-sample reset. */
+             result = old * SOFT_RESET_HISTORY + result * (1.0f - SOFT_RESET_HISTORY);
+          } else {
+              if (old_count > 0.0f) {
+                  /* History clamp before the blend so one firefly sample can
+                   * not corrupt clean history on static-camera frames. */
+                  float hl = lum(old);
+                  float cl = lum(result);
+                  float allowed = hl * FIREFLY_REL_K + FIREFLY_ABS_TOL;
+                  if (cl > allowed && cl > 1e-6f) result *= allowed / cl;
+              }
+              result = old_count > 0.0f
+                  ? (old * old_count + result * (float)spp) / new_count
+                  : result;
+          }
+      }
      out[o] = (float4)(result, 1.0f);
 }
 
 /* Cold-start firefly filter. This is deliberately a separate pass and only
  * launched for the first accumulation frame after a camera reset. It keeps
  * clean detail intact and replaces only isolated bright samples with the
- * local 3x3 neighbourhood mean, matching the CPU fallback. */
+ * local 3x3 luminance median, matching the CPU fallback. */
 __kernel void rt_coldstart(__global const float4 *src, __global float4 *dst,
                            __global const float *frame) {
     const int W = (int)frame[F_W], H = (int)frame[F_H];
@@ -754,19 +767,37 @@ __kernel void rt_coldstart(__global const float4 *src, __global float4 *dst,
     if (x >= W || y >= H) return;
     const float3 center = src[y * W + x].xyz;
     const float center_l = lum(center);
-    float3 sum = (float3)(0.0f);
+    float lum_values[9];
+    float3 color_values[9];
+    int count = 0;
+    lum_values[count] = center_l;
+    color_values[count++] = center;
     for (int oy = -1; oy <= 1; oy++) {
         const int ny = clamp(y + oy, 0, H - 1);
         for (int ox = -1; ox <= 1; ox++) {
             if (ox == 0 && oy == 0) continue;
             const int nx = clamp(x + ox, 0, W - 1);
-            sum += src[ny * W + nx].xyz;
+            const float3 value = src[ny * W + nx].xyz;
+            lum_values[count] = lum(value);
+            color_values[count++] = value;
         }
     }
-    const float3 mean = sum * (1.0f / 8.0f);
-    const float allowed = lum(mean) * FIREFLY_REL_K + FIREFLY_ABS_TOL;
-    dst[y * W + x] = center_l > allowed
-        ? (float4)(mean, 1.0f) : src[y * W + x];
+    for (int i = 1; i < count; i++) {
+        const float l = lum_values[i];
+        const float3 c = color_values[i];
+        int j = i;
+        while (j > 0 && lum_values[j - 1] > l) {
+            lum_values[j] = lum_values[j - 1];
+            color_values[j] = color_values[j - 1];
+            j--;
+        }
+        lum_values[j] = l;
+        color_values[j] = c;
+    }
+    const float median_l = lum_values[4];
+    const float allowed = median_l * FIREFLY_REL_K + FIREFLY_ABS_TOL;
+    dst[y * W + x] = center_l > allowed || center_l > INPUT_LUMINANCE_CLAMP
+        ? (float4)(color_values[4], 1.0f) : src[y * W + x];
 }
 
 __kernel void rt_copy_hdr(__global const float4 *src, __global float4 *dst,

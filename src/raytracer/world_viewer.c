@@ -383,8 +383,9 @@ int main(int argc, char **argv) {
         if (!gpu_used && accumulate) {
             static int cpu_samples;
             if (accumulation_reset) cpu_samples = 0;
-            if (!rt_render_progressive_hdr(&scene, cpu_accum, frame_w, frame_h,
-                                           frame_spp, cpu_samples, 4) ||
+            if (!rt_render_progressive_hdr_reset(&scene, cpu_accum, frame_w, frame_h,
+                                                  frame_spp, cpu_samples, 4,
+                                                  accumulation_reset) ||
                 !rt_postprocess_hdr(cpu_accum, rgb, frame_w, frame_h)) {
                 TraceLog(LOG_ERROR, "CPU accumulation failed");
                 break;
